@@ -44,6 +44,7 @@ def test_account_create_rejects_unknown_or_inexact_account_type(
             {
                 "name": "Plan",
                 "reporting_currency_code": "BOB",
+                "budget_timezone": "America/La_Paz",
                 "balance": 1.0,
             },
         ),

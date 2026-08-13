@@ -12,7 +12,7 @@ from app.settings import Settings
 
 
 INITIAL_REVISION = "001_foundation"
-EXPECTED_REVISION = "002_accounts"
+EXPECTED_REVISION = "003_ledger_core"
 
 
 class Base(DeclarativeBase):

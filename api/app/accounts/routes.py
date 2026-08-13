@@ -21,6 +21,7 @@ from app.accounts.service import (
     ResourceNotFound,
     UnknownCurrency,
     account_response,
+    account_balance,
     archive_account,
     create_account,
     create_plan,
@@ -58,6 +59,13 @@ def _unknown_currency(exc: UnknownCurrency) -> HTTPException:
     )
 
 
+def _ledger_validation(exc: ValueError) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail=str(exc),
+    )
+
+
 @router.get("/currencies", response_model=list[CurrencyResponse])
 def read_currencies(
     session: Session = Depends(get_database_session),
@@ -83,6 +91,8 @@ def put_plan(
         raise _conflict(exc) from exc
     except UnknownCurrency as exc:
         raise _unknown_currency(exc) from exc
+    except ValueError as exc:
+        raise _ledger_validation(exc) from exc
     if not result.created:
         response.status_code = status.HTTP_200_OK
     return result.resource

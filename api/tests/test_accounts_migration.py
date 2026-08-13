@@ -78,15 +78,46 @@ def test_clean_postgresql_18_database_reaches_accounts_head(
 
         config = _alembic_config(database_url)
         scripts = ScriptDirectory.from_config(config)
-        assert scripts.get_revision(EXPECTED_REVISION).down_revision == "001_foundation"
+        assert scripts.get_revision(EXPECTED_REVISION).down_revision == "002_accounts"
 
         command.upgrade(config, "head")
 
         database_inspector = inspect(engine)
-        assert {"jobs", "currencies", "plans", "accounts"} <= set(
+        assert {
+            "jobs",
+            "currencies",
+            "plans",
+            "accounts",
+            "category_groups",
+            "categories",
+            "tags",
+            "transactions",
+            "transaction_tags",
+            "posted_account_movements",
+            "transaction_corrections",
+            "monthly_budget_assignments",
+        } <= set(
             database_inspector.get_table_names()
         )
         assert _current_revision(database_url) == EXPECTED_REVISION
+
+        correction_columns = {
+            column["name"]
+            for column in database_inspector.get_columns("transaction_corrections")
+        }
+        movement_columns = {
+            column["name"]
+            for column in database_inspector.get_columns("posted_account_movements")
+        }
+        assert "correction_sequence" in correction_columns
+        assert "correction_sequence" in movement_columns
+        correction_constraints = {
+            constraint["name"]
+            for constraint in database_inspector.get_unique_constraints(
+                "transaction_corrections"
+            )
+        }
+        assert "uq_transaction_corrections_transaction_sequence" in correction_constraints
 
         with engine.connect() as connection:
             assert connection.execute(
@@ -105,6 +136,7 @@ def test_clean_postgresql_18_database_reaches_accounts_head(
             "id",
             "name",
             "reporting_currency_code",
+            "budget_timezone",
             "creation_fingerprint",
             "created_at",
             "updated_at",
@@ -122,6 +154,7 @@ def test_clean_postgresql_18_database_reaches_accounts_head(
         }
         assert "balance" not in plan_columns | account_columns
         assert "opening_balance" not in plan_columns | account_columns
+        assert plan_columns["budget_timezone"]["nullable"] is False
         assert all(
             column["type"].__class__.__name__.upper()
             not in {"REAL", "DOUBLE", "FLOAT"}
@@ -217,4 +250,36 @@ def test_upgrade_from_foundation_then_repeated_head_is_no_op(
         )
         assert before_second_upgrade == after_second_upgrade
         assert after_second_upgrade[0] == EXPECTED_REVISION
+        engine.dispose()
+
+
+def test_upgrade_from_accounts_backfills_timezone_and_pending_then_is_no_op(
+    postgres_url: str,
+) -> None:
+    with _temporary_database(postgres_url) as database_url:
+        config = _alembic_config(database_url)
+        command.upgrade(config, "002_accounts")
+        plan_id = uuid4()
+        engine = create_engine(database_url)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO plans "
+                    "(id, name, reporting_currency_code, creation_fingerprint) "
+                    "VALUES (:id, 'Existing', 'BOB', 'legacy')"
+                ),
+                {"id": plan_id},
+            )
+        command.upgrade(config, "head")
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            assert connection.execute(
+                text(
+                    "SELECT budget_timezone, count(*) FROM plans p "
+                    "JOIN categories c ON c.plan_id = p.id "
+                    "WHERE p.id = :id AND c.is_pending GROUP BY budget_timezone"
+                ),
+                {"id": plan_id},
+            ).one() == ("America/La_Paz", 1)
+            assert _current_revision(database_url) == EXPECTED_REVISION
         engine.dispose()

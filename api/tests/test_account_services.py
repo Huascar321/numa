@@ -4,10 +4,20 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.accounts import Account, Plan
+from app.ledger import (
+    Category,
+    CategoryGroup,
+    MonthlyBudgetAssignment,
+    PostedAccountMovement,
+    Tag,
+    Transaction,
+    TransactionCorrection,
+    TransactionTag,
+)
 from app.accounts.schemas import AccountCreate
 from app.accounts.service import (
     CreationConflict,
@@ -30,12 +40,18 @@ pytestmark = pytest.mark.postgres
 @pytest.fixture(autouse=True)
 def clean_accounts(postgres_sessions: sessionmaker[Session]):
     with postgres_sessions.begin() as session:
-        session.execute(delete(Account))
-        session.execute(delete(Plan))
+        session.execute(text(
+            "TRUNCATE transaction_tags, posted_account_movements, "
+            "transaction_corrections, monthly_budget_assignments, transactions, "
+            "tags, categories, category_groups, accounts, plans CASCADE"
+        ))
     yield
     with postgres_sessions.begin() as session:
-        session.execute(delete(Account))
-        session.execute(delete(Plan))
+        session.execute(text(
+            "TRUNCATE transaction_tags, posted_account_movements, "
+            "transaction_corrections, monthly_budget_assignments, transactions, "
+            "tags, categories, category_groups, accounts, plans CASCADE"
+        ))
 
 
 def _create_plan(
@@ -47,7 +63,11 @@ def _create_plan(
         return create_plan(
             session,
             plan_id=plan_id or uuid4(),
-            payload=PlanCreate(name="Plan", reporting_currency_code="BOB"),
+            payload=PlanCreate(
+                name="Plan",
+                reporting_currency_code="BOB",
+                budget_timezone="America/La_Paz",
+            ),
         ).resource
 
 

@@ -4,10 +4,20 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete
+from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.accounts import Account, Plan
+from app.ledger import (
+    Category,
+    CategoryGroup,
+    MonthlyBudgetAssignment,
+    PostedAccountMovement,
+    Tag,
+    Transaction,
+    TransactionCorrection,
+    TransactionTag,
+)
 from app.main import create_app
 from app.settings import Settings
 
@@ -18,12 +28,18 @@ pytestmark = pytest.mark.postgres
 @pytest.fixture(autouse=True)
 def clean_accounts(postgres_sessions: sessionmaker[Session]):
     with postgres_sessions.begin() as session:
-        session.execute(delete(Account))
-        session.execute(delete(Plan))
+        session.execute(text(
+            "TRUNCATE transaction_tags, posted_account_movements, "
+            "transaction_corrections, monthly_budget_assignments, transactions, "
+            "tags, categories, category_groups, accounts, plans CASCADE"
+        ))
     yield
     with postgres_sessions.begin() as session:
-        session.execute(delete(Account))
-        session.execute(delete(Plan))
+        session.execute(text(
+            "TRUNCATE transaction_tags, posted_account_movements, "
+            "transaction_corrections, monthly_budget_assignments, transactions, "
+            "tags, categories, category_groups, accounts, plans CASCADE"
+        ))
 
 
 @pytest.fixture
@@ -35,7 +51,11 @@ def _create_plan(client: TestClient, *, name: str = "Plan") -> tuple[str, dict]:
     plan_id = str(uuid4())
     response = client.put(
         f"/plans/{plan_id}",
-        json={"name": name, "reporting_currency_code": "BOB"},
+        json={
+            "name": name,
+            "reporting_currency_code": "BOB",
+            "budget_timezone": "America/La_Paz",
+        },
     )
     assert response.status_code == 201
     return plan_id, response.json()
@@ -65,14 +85,22 @@ def test_currencies_and_plan_endpoints_have_authoritative_contracts(
 
     replay = client.put(
         f"/plans/{plan_id}",
-        json={"name": "Plan", "reporting_currency_code": "BOB"},
+        json={
+            "name": "Plan",
+            "reporting_currency_code": "BOB",
+            "budget_timezone": "America/La_Paz",
+        },
     )
     assert replay.status_code == 200
     assert replay.json()["name"] == "Renamed"
 
     conflict = client.put(
         f"/plans/{plan_id}",
-        json={"name": "Other", "reporting_currency_code": "USDT"},
+        json={
+            "name": "Other",
+            "reporting_currency_code": "USDT",
+            "budget_timezone": "America/La_Paz",
+        },
     )
     assert conflict.status_code == 409
     assert client.get(f"/plans/{plan_id}").json()["name"] == "Renamed"
@@ -81,11 +109,11 @@ def test_currencies_and_plan_endpoints_have_authoritative_contracts(
 @pytest.mark.parametrize(
     "payload",
     [
-        {"name": "Plan", "reporting_currency_code": "BOB", "balance": "0.00"},
-        {"name": "Plan", "reporting_currency_code": "BOB", "opening_balance": "0.00"},
-        {"name": "Plan", "reporting_currency_code": "BOB", "currency_change": "USDT"},
-        {"name": "Plan", "reporting_currency_code": "BOB", "tipo": "Bank"},
-        {"name": "Plan", "reporting_currency_code": "BOB", "Plan": "other"},
+        {"name": "Plan", "reporting_currency_code": "BOB", "budget_timezone": "America/La_Paz", "balance": "0.00"},
+        {"name": "Plan", "reporting_currency_code": "BOB", "budget_timezone": "America/La_Paz", "opening_balance": "0.00"},
+        {"name": "Plan", "reporting_currency_code": "BOB", "budget_timezone": "America/La_Paz", "currency_change": "USDT"},
+        {"name": "Plan", "reporting_currency_code": "BOB", "budget_timezone": "America/La_Paz", "tipo": "Bank"},
+        {"name": "Plan", "reporting_currency_code": "BOB", "budget_timezone": "America/La_Paz", "Plan": "other"},
     ],
 )
 def test_plan_create_rejects_additional_financial_or_identity_fields(

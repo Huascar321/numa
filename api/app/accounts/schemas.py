@@ -3,8 +3,16 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, StrictStr, StringConstraints
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictStr,
+    StringConstraints,
+    field_validator,
+)
 from typing_extensions import Annotated
 
 
@@ -41,6 +49,18 @@ class CurrencyResponse(BaseModel):
 class PlanCreate(StrictRequest):
     name: NonEmptyName
     reporting_currency_code: CurrencyCode
+    budget_timezone: str | None = None
+
+    @field_validator("budget_timezone")
+    @classmethod
+    def validate_budget_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("budget_timezone must be a valid IANA timezone") from exc
+        return value
 
 
 class PlanRename(StrictRequest):
@@ -53,6 +73,7 @@ class PlanResponse(BaseModel):
     id: UUID
     name: str
     reporting_currency_code: str
+    budget_timezone: str
     created_at: datetime
     updated_at: datetime
 

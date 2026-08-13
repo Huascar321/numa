@@ -6,13 +6,14 @@ from decimal import Decimal
 from hashlib import sha256
 import json
 from typing import Generic, TypeVar, cast
-from uuid import UUID
+from uuid import UUID, uuid5
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from app.accounts.models import Account, Currency, Plan
+from app.ledger.models import Category, PostedAccountMovement
 from app.accounts.schemas import (
     AccountCreate,
     AccountStatus,
@@ -55,7 +56,7 @@ def require_currency(session: Session, code: str) -> Currency:
     return currency
 
 
-def _creation_fingerprint(payload: dict[str, str]) -> str:
+def _creation_fingerprint(payload: dict[str, object]) -> str:
     canonical_payload = json.dumps(
         payload,
         ensure_ascii=False,
@@ -75,18 +76,38 @@ def create_plan(
     plan_id: UUID,
     payload: PlanCreate,
 ) -> CreationResult[Plan]:
+    persisted_timezone = payload.budget_timezone
     fingerprint = _creation_fingerprint(
         {
             "name": payload.name,
             "reporting_currency_code": payload.reporting_currency_code,
+            "budget_timezone": persisted_timezone,
         }
     )
     existing = session.get(Plan, plan_id)
     if existing is not None:
-        if existing.creation_fingerprint != fingerprint:
+        legacy_fingerprint = _creation_fingerprint(
+            {
+                "name": payload.name,
+                "reporting_currency_code": payload.reporting_currency_code,
+            }
+        )
+        if existing.creation_fingerprint not in {fingerprint, legacy_fingerprint}:
             raise CreationConflict("Plan UUID has a different creation payload")
+        if existing.creation_fingerprint == legacy_fingerprint:
+            # This is the unmodified 002_accounts identity. It must continue
+            # to replay after 003 adds the immutable timezone column.
+            if payload.budget_timezone is not None and existing.budget_timezone != payload.budget_timezone:
+                raise CreationConflict(
+                    "legacy Plan identity cannot change its persisted budget timezone"
+                )
+            return CreationResult(resource=existing, created=False)
+        if payload.budget_timezone is None:
+            raise CreationConflict("budget_timezone is required for this Plan identity")
         return CreationResult(resource=existing, created=False)
 
+    if persisted_timezone is None:
+        raise ValueError("budget_timezone is required when creating a Plan")
     require_currency(session, payload.reporting_currency_code)
     inserted_id = session.scalar(
         insert(Plan)
@@ -94,6 +115,7 @@ def create_plan(
             id=plan_id,
             name=payload.name,
             reporting_currency_code=payload.reporting_currency_code,
+            budget_timezone=persisted_timezone,
             creation_fingerprint=fingerprint,
         )
         .on_conflict_do_nothing(index_elements=(Plan.id,))
@@ -104,6 +126,26 @@ def create_plan(
         raise RuntimeError("created Plan could not be loaded")
     if plan.creation_fingerprint != fingerprint:
         raise CreationConflict("Plan UUID has a different creation payload")
+    pending = session.scalar(
+        select(Category).where(
+            Category.plan_id == plan_id,
+            Category.is_pending.is_(True),
+        )
+    )
+    if pending is None:
+        session.add(
+            Category(
+                id=uuid5(plan_id, "Pendientes"),
+                plan_id=plan_id,
+                name="Pendientes",
+                is_pending=True,
+                status="active",
+                creation_fingerprint=_creation_fingerprint(
+                    {"plan_id": str(plan_id), "name": "Pendientes", "system": True}
+                ),
+            )
+        )
+        session.flush()
     return CreationResult(resource=plan, created=inserted_id is not None)
 
 
@@ -242,7 +284,14 @@ def archive_account(
 def account_balance(session: Session, account: Account) -> BalanceResponse:
     currency = require_currency(session, account.currency_code)
     scale = Decimal(1).scaleb(-currency.decimal_places)
-    amount = Decimal(0).quantize(scale)
+    amount = session.scalar(
+        select(func.coalesce(func.sum(PostedAccountMovement.signed_amount), 0)).where(
+            PostedAccountMovement.plan_id == account.plan_id,
+            PostedAccountMovement.account_id == account.id,
+            PostedAccountMovement.currency_code == account.currency_code,
+        )
+    ) or Decimal(0)
+    amount = Decimal(amount).quantize(scale)
     return BalanceResponse(
         amount=format(amount, "f"),
         currency=currency.code,

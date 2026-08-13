@@ -7,6 +7,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    UniqueConstraint,
     Index,
     Integer,
     String,
@@ -49,6 +50,7 @@ class Plan(Base):
         ),
         nullable=False,
     )
+    budget_timezone: Mapped[str] = mapped_column(String(64), nullable=False)
     creation_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
@@ -73,6 +75,7 @@ class Account(Base):
         ),
         Index("ix_accounts_plan_id", "plan_id"),
         Index("ix_accounts_plan_status", "plan_id", "status"),
+        UniqueConstraint("plan_id", "id", name="uq_accounts_plan_id_id"),
     )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)

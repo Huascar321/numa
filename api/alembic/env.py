@@ -8,6 +8,7 @@ from sqlalchemy import engine_from_config, pool
 from app.accounts import models as account_models  # noqa: F401 - migration metadata
 from app.db import Base
 from app.jobs import models  # noqa: F401 - registers migration metadata
+from app.ledger import models as ledger_models  # noqa: F401 - ledger metadata
 from app.settings import Settings
 
 config = context.config

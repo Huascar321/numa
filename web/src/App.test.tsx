@@ -12,6 +12,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AppRoutes } from "./App";
+import type { Category, CategoryGroup, Tag } from "./api";
 
 type TestPlan = {
   id: string;
@@ -142,6 +143,211 @@ function createServer() {
   };
 }
 
+function createLedgerServer() {
+  const planId = "plan-ledger";
+  const accountId = "account-ledger";
+  const pendingId = "category-pending";
+  const categoryId = "category-groceries";
+  const groupId = "group-needs";
+  const tagId = "tag-recurring";
+  const plan: TestPlan & { budget_timezone: string } = {
+    id: planId,
+    name: "Ledger Plan",
+    reporting_currency_code: "BOB",
+    budget_timezone: "America/La_Paz",
+    created_at: timestamp,
+    updated_at: timestamp,
+  };
+  const accounts: TestAccount[] = [{
+    id: accountId,
+    plan_id: planId,
+    name: "Main account",
+    account_type: "Bank",
+    currency_code: "BOB",
+    status: "active",
+    balance: { amount: "0.00", currency: "BOB" },
+    created_at: timestamp,
+    updated_at: timestamp,
+  }];
+  const categories: Category[] = [
+    {
+      id: pendingId,
+      plan_id: planId,
+      group_id: null,
+      name: "Pendientes",
+      is_pending: true,
+      status: "active" as const,
+      created_at: timestamp,
+      updated_at: timestamp,
+    },
+    {
+      id: categoryId,
+      plan_id: planId,
+      group_id: null,
+      name: "Groceries",
+      is_pending: false,
+      status: "active" as const,
+      created_at: timestamp,
+      updated_at: timestamp,
+    },
+  ];
+  const groups: CategoryGroup[] = [{
+    id: groupId,
+    plan_id: planId,
+    name: "Needs",
+    status: "active" as const,
+    created_at: timestamp,
+    updated_at: timestamp,
+  }];
+  const tags: Tag[] = [{
+    id: tagId,
+    plan_id: planId,
+    name: "Recurring",
+    status: "active" as const,
+    created_at: timestamp,
+    updated_at: timestamp,
+  }];
+  const transactions: Array<Record<string, unknown>> = [];
+  const corrections = new Map<string, Array<Record<string, unknown>>>();
+  const assignments: Array<Record<string, unknown>> = [];
+  const fetchMock = vi.fn(async (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    const url = typeof input === "string" ? input : input.toString();
+    const path = new URL(url, "http://localhost").pathname;
+    const method = init?.method ?? "GET";
+    const body = init?.body
+      ? JSON.parse(String(init.body)) as Record<string, unknown>
+      : {};
+    if (path === "/currencies" && method === "GET") {
+      return jsonResponse([
+        { code: "BOB", decimal_places: 2 },
+        { code: "USDT", decimal_places: 6 },
+      ]);
+    }
+    if (path === `/plans/${planId}` && method === "GET") return jsonResponse(plan);
+    if (path === `/plans/${planId}/accounts` && method === "GET") return jsonResponse(accounts);
+    if (path === `/plans/${planId}/categories` && method === "GET") return jsonResponse(categories);
+    if (path === `/plans/${planId}/category-groups` && method === "GET") return jsonResponse(groups);
+    if (path === `/plans/${planId}/tags` && method === "GET") return jsonResponse(tags);
+
+    const groupPut = path.match(new RegExp(`^/plans/${planId}/category-groups/([^/]+)$`));
+    if (groupPut && method === "PUT") {
+      const group = {
+        id: groupPut[1], plan_id: planId, name: String(body.name), status: "active" as const,
+        created_at: timestamp, updated_at: timestamp,
+      };
+      groups.push(group);
+      return jsonResponse(group, 201);
+    }
+    const groupArchive = path.match(new RegExp(`^/plans/${planId}/category-groups/([^/]+)/archive$`));
+    if (groupArchive && method === "POST") {
+      const group = groups.find((item) => item.id === groupArchive[1]);
+      if (!group) return jsonResponse({}, 404);
+      group.status = "archived";
+      return jsonResponse(group);
+    }
+    const categoryPut = path.match(new RegExp(`^/plans/${planId}/categories/([^/]+)$`));
+    if (categoryPut && method === "PUT") {
+      const category = {
+        id: categoryPut[1], plan_id: planId, group_id: (body.group_id as string | null) ?? null,
+        name: String(body.name), is_pending: false, status: "active" as const,
+        created_at: timestamp, updated_at: timestamp,
+      };
+      categories.push(category);
+      return jsonResponse(category, 201);
+    }
+    const categoryArchive = path.match(new RegExp(`^/plans/${planId}/categories/([^/]+)/archive$`));
+    if (categoryArchive && method === "POST") {
+      const category = categories.find((item) => item.id === categoryArchive[1]);
+      if (!category || category.is_pending) return jsonResponse({}, 409);
+      category.status = "archived";
+      return jsonResponse(category);
+    }
+    const tagPut = path.match(new RegExp(`^/plans/${planId}/tags/([^/]+)$`));
+    if (tagPut && method === "PUT") {
+      const tag = {
+        id: tagPut[1], plan_id: planId, name: String(body.name), status: "active" as const,
+        created_at: timestamp, updated_at: timestamp,
+      };
+      tags.push(tag);
+      return jsonResponse(tag, 201);
+    }
+    const tagArchive = path.match(new RegExp(`^/plans/${planId}/tags/([^/]+)/archive$`));
+    if (tagArchive && method === "POST") {
+      const tag = tags.find((item) => item.id === tagArchive[1]);
+      if (!tag) return jsonResponse({}, 404);
+      tag.status = "archived";
+      return jsonResponse(tag);
+    }
+
+    if (path === `/plans/${planId}/transactions` && method === "GET") {
+      return jsonResponse(transactions);
+    }
+    const transactionPut = path.match(new RegExp(`^/plans/${planId}/transactions/([^/]+)$`));
+    if (transactionPut && method === "PUT") {
+      const transaction = {
+        id: transactionPut[1], plan_id: planId, account_id: String(body.account_id),
+        type: body.type, amount: String(body.amount), currency_code: String(body.currency_code),
+        event_at: String(body.event_at), category_id: (body.category_id as string | undefined) ?? pendingId,
+        merchant: (body.merchant as string | undefined) ?? null,
+        memo: (body.memo as string | undefined) ?? null, photo_reference: null, location: null,
+        tags: (body.tags as string[] | undefined) ?? [], source: "manual", source_metadata: {},
+        provenance: {}, created_at: timestamp, updated_at: timestamp,
+      };
+      transactions.push(transaction);
+      const account = accounts.find((item) => item.id === transaction.account_id);
+      if (account) account.balance.amount = `-${transaction.amount as string}`;
+      return jsonResponse(transaction, 201);
+    }
+    const correctionsPath = path.match(new RegExp(`^/plans/${planId}/transactions/([^/]+)/corrections$`));
+    if (correctionsPath && method === "GET") return jsonResponse(corrections.get(correctionsPath[1]) ?? []);
+    const correctionPut = path.match(new RegExp(`^/plans/${planId}/transactions/([^/]+)/corrections/([^/]+)$`));
+    if (correctionPut && method === "PUT") {
+      const transaction = transactions.find((item) => item.id === correctionPut[1]);
+      if (!transaction) return jsonResponse({}, 404);
+      const transactionKey = String(transaction.id);
+      const history = corrections.get(transactionKey) ?? [];
+      const before = { ...transaction };
+      if (body.amount !== undefined) transaction.amount = String(body.amount);
+      const after = { ...transaction };
+      const correction = {
+        id: correctionPut[2], plan_id: planId, transaction_id: transaction.id,
+        correction_sequence: history.length + 1, before_snapshot: before,
+        after_snapshot: after, provenance: {}, created_at: timestamp,
+      };
+      history.push(correction);
+      corrections.set(transactionKey, history);
+      const account = accounts.find((item) => item.id === String(transaction.account_id));
+      if (account) account.balance.amount = `-${transaction.amount as string}`;
+      return jsonResponse(correction, 201);
+    }
+
+    const summaryPath = path.match(new RegExp(`^/plans/${planId}/budget/months/([^/]+)$`));
+    if (summaryPath && method === "GET") {
+      const amount = transactions[0]?.amount === "15.00" ? "-15.00" : transactions.length ? "-12.00" : "0.00";
+      const assigned = assignments.reduce((sum, item) => sum + Number(item.amount), 0);
+      return jsonResponse({
+        plan_id: planId, month: summaryPath[1], currency: "BOB", ready_to_assign: "0.00",
+        assigned_total: assigned.toFixed(2), activity_total: amount,
+        available_total: (assigned + Number(amount)).toFixed(2),
+        unconverted_by_currency: [{ currency: "USDT", income: "0.000000", expense: "-1.000000", amount: "-1.000000", movement_ids: ["movement-usdt"], transaction_ids: ["transaction-usdt"] }],
+        categories: [{ plan_id: planId, category_id: categoryId, month: summaryPath[1], currency: "BOB", assigned: assigned.toFixed(2), activity: amount, available: (assigned + Number(amount)).toFixed(2), unconverted_by_currency: [{ currency: "USDT", income: "0.000000", expense: "-1.000000", amount: "-1.000000", movement_ids: ["movement-usdt"], transaction_ids: ["transaction-usdt"] }] }],
+      });
+    }
+    const assignmentPut = path.match(new RegExp(`^/plans/${planId}/budget-assignments/([^/]+)$`));
+    if (assignmentPut && method === "PUT") {
+      const assignment = { id: assignmentPut[1], plan_id: planId, category_id: body.category_id, month_key: body.month, amount: body.amount, currency_code: "BOB", source: "manual", provenance: {}, created_at: timestamp };
+      assignments.push(assignment);
+      return jsonResponse(assignment, 201);
+    }
+    return jsonResponse({}, 404);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return { planId, accountId, fetchMock };
+}
+
 function renderApp(initialEntry: string) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -173,8 +379,8 @@ describe("minimal authoritative client flows", () => {
     fireEvent.change(name, { target: { value: "Personal Plan" } });
     fireEvent.click(screen.getByRole("button", { name: "Create Plan" }));
 
-    expect(await screen.findByRole("heading", { name: "Accounts" })).toBeInTheDocument();
-    expect(screen.getByText("Personal Plan")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { level: 1, name: "Accounts" })).toBeInTheDocument();
+    expect(await screen.findByText("Personal Plan")).toBeInTheDocument();
   });
 
   it("lists and renames a selected Plan without changing its currency", async () => {
@@ -245,5 +451,66 @@ describe("minimal authoritative client flows", () => {
       .not.toBeInTheDocument();
     expect(document.querySelector('link[rel="manifest"]')).not.toBeInTheDocument();
     await waitFor(() => expect(server.getAccountRequests.length).toBeGreaterThanOrEqual(4));
+  });
+
+  it("protects Pendientes and creates and archives taxonomy resources", async () => {
+    createLedgerServer();
+    renderApp("/plans/plan-ledger/ledger");
+
+    expect(await screen.findByRole("heading", { name: "Ledger" })).toBeInTheDocument();
+    const pendingLabel = await screen.findByText("Pendientes", { selector: "strong" });
+    const pending = pendingLabel.closest(".taxonomy-item") as HTMLElement;
+    expect(within(pending).queryByRole("button", { name: "Rename" })).not.toBeInTheDocument();
+    expect(within(pending).queryByRole("button", { name: "Archive" })).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Category Group"), { target: { value: "Optional" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add Group" }));
+    expect(await screen.findByText("Optional")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Category", { selector: "input" }), { target: { value: "Dining" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add Category" }));
+    const dining = await screen.findByText("Dining");
+    expect(dining).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Tag"), { target: { value: "Travel" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add Tag" }));
+    expect(await screen.findByText("Travel")).toBeInTheDocument();
+
+    const groceries = screen.getAllByText("Groceries", { selector: "strong" })[0]
+      .closest(".taxonomy-item") as HTMLElement;
+    fireEvent.click(within(groceries).getByRole("button", { name: "Archive" }));
+    await waitFor(() => expect(within(groceries).getByText("archived")).toBeInTheDocument());
+  });
+
+  it("posts, corrects, assigns, and refetches authoritative ledger projections", async () => {
+    const server = createLedgerServer();
+    renderApp("/plans/plan-ledger/ledger");
+
+    expect(await screen.findByRole("heading", { name: "Ledger" })).toBeInTheDocument();
+    expect(await screen.findByRole("option", { name: /Main account/ })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Amount (exact decimal string)"), {
+      target: { value: "12.00" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Post" }));
+    expect(await screen.findByText((text) => text.includes("expense 12.00 BOB"))).toBeInTheDocument();
+    expect(await screen.findByText((text) => text.includes("-12.00 BOB"))).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "View detail and correct" }));
+    const correctionInput = await screen.findByLabelText("Replacement amount");
+    fireEvent.change(correctionInput, { target: { value: "15.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save correction" }));
+    expect(await screen.findByText((text) => text.includes("expense 15.00 BOB"))).toBeInTheDocument();
+    expect(await screen.findByText((text) => text.includes("-15.00 BOB"))).toBeInTheDocument();
+    expect(await screen.findByText("#1: 12.00 → 15.00")).toBeInTheDocument();
+
+    const assignmentCategory = screen.getAllByLabelText("Category").at(-1);
+    expect(assignmentCategory).toBeDefined();
+    fireEvent.change(assignmentCategory as HTMLSelectElement, { target: { value: "category-groceries" } });
+    fireEvent.change(screen.getByLabelText("Assignment (exact decimal string)"), {
+      target: { value: "20.00" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Assign" }));
+    expect(await screen.findByText(/Assigned 20\.00/)).toBeInTheDocument();
+    expect(screen.getAllByText(/Unconverted USDT: -1\.000000/).length).toBeGreaterThan(0);
+    expect(server.fetchMock.mock.calls.some(([path]) => String(path).includes("/budget/months/"))).toBe(true);
   });
 });

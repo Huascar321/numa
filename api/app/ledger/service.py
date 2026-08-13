@@ -1,0 +1,1334 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from hashlib import sha256
+import json
+from typing import Any, Generic, Iterable, TypeVar
+from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import Session
+
+from app.accounts.models import Account, Currency, Plan
+from app.accounts.service import (
+    CreationConflict,
+    ResourceNotFound,
+    UnknownCurrency,
+    require_currency,
+)
+from app.ledger.models import (
+    Category,
+    CategoryGroup,
+    MonthlyBudgetAssignment,
+    PostedAccountMovement,
+    Tag,
+    Transaction,
+    TransactionCorrection,
+    TransactionTag,
+)
+from app.ledger.schemas import (
+    AssignmentCreate,
+    AssignmentResponse,
+    CategoryCreate,
+    CategoryGroupCreate,
+    CategoryGroupPatch,
+    CategoryPatch,
+    TagCreate,
+    TagPatch,
+    TransactionCorrectionCreate,
+    TransactionCreate,
+)
+
+
+class LedgerValidationError(ValueError):
+    """The request violates an exact-money or ledger invariant."""
+
+
+class ArchivedResource(LedgerValidationError):
+    """An archived resource cannot be used for a new operation."""
+
+
+class ProtectedResource(LedgerValidationError):
+    """A protected Pendientes resource cannot be mutated."""
+
+
+class GroupHasActiveCategories(LedgerValidationError):
+    """An active Category prevents its Group from being archived."""
+
+
+Resource = TypeVar("Resource")
+
+
+@dataclass(frozen=True)
+class CreationResult(Generic[Resource]):
+    resource: Resource
+    created: bool
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def fingerprint(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        _jsonable(payload),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def parse_exact_decimal(value: str, *, field_name: str = "amount") -> Decimal:
+    if not isinstance(value, str):
+        raise LedgerValidationError(f"{field_name} must be a decimal string")
+    try:
+        amount = Decimal(value)
+    except (InvalidOperation, ValueError) as exc:
+        raise LedgerValidationError(f"{field_name} must be a valid decimal string") from exc
+    if not amount.is_finite():
+        raise LedgerValidationError(f"{field_name} must be finite")
+    return amount
+
+
+def quantize_at_scale(amount: Decimal, decimal_places: int, *, positive: bool) -> Decimal:
+    if positive and amount <= 0:
+        raise LedgerValidationError("amount must be positive")
+    quantum = Decimal(1).scaleb(-decimal_places)
+    try:
+        quantized = amount.quantize(quantum)
+    except InvalidOperation as exc:
+        raise LedgerValidationError("amount has an invalid scale") from exc
+    if quantized != amount:
+        raise LedgerValidationError("amount has more decimal places than its currency")
+    return quantized
+
+
+def amount_for_currency(
+    session: Session,
+    value: str,
+    currency_code: str,
+    *,
+    positive: bool,
+) -> Decimal:
+    currency = require_currency(session, currency_code)
+    amount = parse_exact_decimal(value)
+    return quantize_at_scale(amount, currency.decimal_places, positive=positive)
+
+
+def fixed_amount(amount: Decimal, currency: Currency) -> str:
+    return format(amount.quantize(Decimal(1).scaleb(-currency.decimal_places)), "f")
+
+
+def require_aware_timestamp(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise LedgerValidationError("event_at must include a timezone offset")
+    return value
+
+
+def _get_plan(session: Session, plan_id: UUID) -> Plan:
+    plan = session.get(Plan, plan_id)
+    if plan is None:
+        raise ResourceNotFound("Plan not found")
+    return plan
+
+
+def _get_group(session: Session, plan_id: UUID, group_id: UUID) -> CategoryGroup:
+    group = session.scalar(
+        select(CategoryGroup).where(
+            CategoryGroup.plan_id == plan_id, CategoryGroup.id == group_id
+        )
+    )
+    if group is None:
+        raise ResourceNotFound("Category Group not found")
+    return group
+
+
+def _get_category(session: Session, plan_id: UUID, category_id: UUID) -> Category:
+    category = session.scalar(
+        select(Category).where(
+            Category.plan_id == plan_id, Category.id == category_id
+        )
+    )
+    if category is None:
+        raise ResourceNotFound("Category not found")
+    return category
+
+
+def _get_tag(session: Session, plan_id: UUID, tag_id: UUID) -> Tag:
+    tag = session.scalar(
+        select(Tag).where(Tag.plan_id == plan_id, Tag.id == tag_id)
+    )
+    if tag is None:
+        raise ResourceNotFound("Tag not found")
+    return tag
+
+
+def _require_active_category(
+    session: Session, plan_id: UUID, category_id: UUID
+) -> Category:
+    category = _get_category(session, plan_id, category_id)
+    if category.status != "active":
+        raise ArchivedResource("archived Categories cannot be selected")
+    return category
+
+
+def _pending_category(session: Session, plan_id: UUID) -> Category:
+    category = session.scalar(
+        select(Category).where(
+            Category.plan_id == plan_id,
+            Category.is_pending.is_(True),
+            Category.status == "active",
+        )
+    )
+    if category is None:
+        raise RuntimeError("Plan has no protected Pendientes Category")
+    return category
+
+
+def create_category_group(
+    session: Session,
+    *,
+    plan_id: UUID,
+    group_id: UUID,
+    payload: CategoryGroupCreate,
+) -> CreationResult[CategoryGroup]:
+    _get_plan(session, plan_id)
+    request_fingerprint = fingerprint(
+        {"plan_id": plan_id, "name": payload.name}
+    )
+    inserted_id = session.scalar(
+        insert(CategoryGroup)
+        .values(
+            id=group_id,
+            plan_id=plan_id,
+            name=payload.name,
+            creation_fingerprint=request_fingerprint,
+        )
+        .on_conflict_do_nothing()
+        .returning(CategoryGroup.id)
+    )
+    group = session.scalar(
+        select(CategoryGroup)
+        .where(CategoryGroup.id == group_id)
+        .execution_options(populate_existing=True)
+    )
+    if group is None:
+        duplicate = session.scalar(
+            select(CategoryGroup).where(
+                CategoryGroup.plan_id == plan_id,
+                CategoryGroup.name == payload.name,
+            )
+        )
+        if duplicate is not None:
+            raise CreationConflict("Category Group name already exists in this Plan")
+        raise RuntimeError("Category Group creation result could not be loaded")
+    if group.creation_fingerprint != request_fingerprint:
+        raise CreationConflict("Category Group UUID has a different creation payload")
+    if group.plan_id != plan_id:
+        raise CreationConflict("Category Group UUID belongs to another Plan")
+    return CreationResult(group, inserted_id is not None)
+
+
+def list_category_groups(session: Session, plan_id: UUID) -> list[CategoryGroup]:
+    _get_plan(session, plan_id)
+    return list(
+        session.scalars(
+            select(CategoryGroup)
+            .where(CategoryGroup.plan_id == plan_id)
+            .order_by(CategoryGroup.created_at, CategoryGroup.id)
+        )
+    )
+
+
+def patch_category_group(
+    session: Session, *, plan_id: UUID, group_id: UUID, payload: CategoryGroupPatch
+) -> CategoryGroup:
+    group = _get_group(session, plan_id, group_id)
+    if group.status != "active":
+        raise ArchivedResource("archived Category Groups cannot be renamed")
+    group.name = payload.name
+    group.updated_at = utc_now()
+    session.flush()
+    return group
+
+
+def archive_category_group(
+    session: Session, *, plan_id: UUID, group_id: UUID
+) -> CategoryGroup:
+    group = _get_group(session, plan_id, group_id)
+    if group.status == "archived":
+        return group
+    active_category = session.scalar(
+        select(Category.id).where(
+            Category.plan_id == plan_id,
+            Category.group_id == group_id,
+            Category.status == "active",
+        )
+    )
+    if active_category is not None:
+        raise GroupHasActiveCategories("Category Group has active Categories")
+    group.status = "archived"
+    group.updated_at = utc_now()
+    session.flush()
+    return group
+
+
+def create_category(
+    session: Session,
+    *,
+    plan_id: UUID,
+    category_id: UUID,
+    payload: CategoryCreate,
+) -> CreationResult[Category]:
+    _get_plan(session, plan_id)
+    if payload.name == "Pendientes":
+        raise ProtectedResource("Pendientes is protected")
+    if payload.group_id is not None:
+        group = _get_group(session, plan_id, payload.group_id)
+        if group.status != "active":
+            raise ArchivedResource("archived Category Groups cannot be selected")
+    request_fingerprint = fingerprint(
+        {"plan_id": plan_id, "name": payload.name, "group_id": payload.group_id}
+    )
+    inserted_id = session.scalar(
+        insert(Category)
+        .values(
+            id=category_id,
+            plan_id=plan_id,
+            group_id=payload.group_id,
+            name=payload.name,
+            creation_fingerprint=request_fingerprint,
+        )
+        .on_conflict_do_nothing()
+        .returning(Category.id)
+    )
+    category = session.scalar(
+        select(Category)
+        .where(Category.id == category_id)
+        .execution_options(populate_existing=True)
+    )
+    if category is None:
+        duplicate = session.scalar(
+            select(Category).where(
+                Category.plan_id == plan_id,
+                Category.name == payload.name,
+            )
+        )
+        if duplicate is not None:
+            raise CreationConflict("Category name already exists in this Plan")
+        raise RuntimeError("Category creation result could not be loaded")
+    if category.creation_fingerprint != request_fingerprint:
+        raise CreationConflict("Category UUID has a different creation payload")
+    if category.plan_id != plan_id:
+        raise CreationConflict("Category UUID belongs to another Plan")
+    return CreationResult(category, inserted_id is not None)
+
+
+def list_categories(session: Session, plan_id: UUID) -> list[Category]:
+    _get_plan(session, plan_id)
+    return list(
+        session.scalars(
+            select(Category)
+            .where(Category.plan_id == plan_id)
+            .order_by(Category.is_pending.desc(), Category.created_at, Category.id)
+        )
+    )
+
+
+def patch_category(
+    session: Session, *, plan_id: UUID, category_id: UUID, payload: CategoryPatch
+) -> Category:
+    category = _get_category(session, plan_id, category_id)
+    if category.is_pending:
+        raise ProtectedResource("Pendientes is protected")
+    if category.status != "active":
+        raise ArchivedResource("archived Categories cannot be mutated")
+    if payload.name is not None:
+        if payload.name == "Pendientes":
+            raise ProtectedResource("Pendientes is protected")
+        category.name = payload.name
+    if "group_id" in payload.model_fields_set:
+        if payload.group_id is None:
+            category.group_id = None
+        else:
+            group = _get_group(session, plan_id, payload.group_id)
+            if group.status != "active":
+                raise ArchivedResource("archived Category Groups cannot be selected")
+            category.group_id = payload.group_id
+    category.updated_at = utc_now()
+    session.flush()
+    return category
+
+
+def archive_category(
+    session: Session, *, plan_id: UUID, category_id: UUID
+) -> Category:
+    category = _get_category(session, plan_id, category_id)
+    if category.is_pending:
+        raise ProtectedResource("Pendientes is protected")
+    if category.status == "active":
+        category.status = "archived"
+        category.updated_at = utc_now()
+        session.flush()
+    return category
+
+
+def create_tag(
+    session: Session,
+    *,
+    plan_id: UUID,
+    tag_id: UUID,
+    payload: TagCreate,
+) -> CreationResult[Tag]:
+    _get_plan(session, plan_id)
+    request_fingerprint = fingerprint({"plan_id": plan_id, "name": payload.name})
+    inserted_id = session.scalar(
+        insert(Tag)
+        .values(
+            id=tag_id,
+            plan_id=plan_id,
+            name=payload.name,
+            creation_fingerprint=request_fingerprint,
+        )
+        .on_conflict_do_nothing()
+        .returning(Tag.id)
+    )
+    tag = session.scalar(
+        select(Tag)
+        .where(Tag.id == tag_id)
+        .execution_options(populate_existing=True)
+    )
+    if tag is None:
+        duplicate = session.scalar(
+            select(Tag).where(Tag.plan_id == plan_id, Tag.name == payload.name)
+        )
+        if duplicate is not None:
+            raise CreationConflict("Tag name already exists in this Plan")
+        raise RuntimeError("Tag creation result could not be loaded")
+    if tag.creation_fingerprint != request_fingerprint:
+        raise CreationConflict("Tag UUID has a different creation payload")
+    if tag.plan_id != plan_id:
+        raise CreationConflict("Tag UUID belongs to another Plan")
+    return CreationResult(tag, inserted_id is not None)
+
+
+def list_tags(session: Session, plan_id: UUID) -> list[Tag]:
+    _get_plan(session, plan_id)
+    return list(
+        session.scalars(
+            select(Tag).where(Tag.plan_id == plan_id).order_by(Tag.created_at, Tag.id)
+        )
+    )
+
+
+def patch_tag(session: Session, *, plan_id: UUID, tag_id: UUID, payload: TagPatch) -> Tag:
+    tag = _get_tag(session, plan_id, tag_id)
+    if tag.status != "active":
+        raise ArchivedResource("archived Tags cannot be renamed")
+    tag.name = payload.name
+    tag.updated_at = utc_now()
+    session.flush()
+    return tag
+
+
+def archive_tag(session: Session, *, plan_id: UUID, tag_id: UUID) -> Tag:
+    tag = _get_tag(session, plan_id, tag_id)
+    if tag.status == "active":
+        tag.status = "archived"
+        tag.updated_at = utc_now()
+        session.flush()
+    return tag
+
+
+def _validate_tag_ids(
+    session: Session, plan_id: UUID, tag_ids: Iterable[UUID]
+) -> list[UUID]:
+    normalized = list(tag_ids)
+    if len(set(normalized)) != len(normalized):
+        raise LedgerValidationError("tags must not contain duplicates")
+    for tag_id in normalized:
+        tag = _get_tag(session, plan_id, tag_id)
+        if tag.status != "active":
+            raise ArchivedResource("archived Tags cannot be selected")
+    return normalized
+
+
+def _tag_state(session: Session, plan_id: UUID, transaction_id: UUID) -> list[UUID]:
+    links = list(
+        session.scalars(
+            select(TransactionTag)
+            .where(
+                TransactionTag.plan_id == plan_id,
+                TransactionTag.transaction_id == transaction_id,
+            )
+            .order_by(TransactionTag.created_at, TransactionTag.id)
+        )
+    )
+    states: dict[UUID, str] = {}
+    for link in links:
+        states[link.tag_id] = link.action
+    return sorted(tag_id for tag_id, action in states.items() if action == "attached")
+
+
+def transaction_snapshot(
+    session: Session, transaction: Transaction, *, tags: list[UUID] | None = None
+) -> dict[str, Any]:
+    currency = require_currency(session, transaction.currency_code)
+    return {
+        "id": str(transaction.id),
+        "plan_id": str(transaction.plan_id),
+        "account_id": str(transaction.account_id),
+        "type": transaction.type,
+        "amount": fixed_amount(Decimal(transaction.amount), currency),
+        "currency_code": transaction.currency_code,
+        "event_at": transaction.event_at.isoformat(),
+        "category_id": str(transaction.category_id),
+        "merchant": transaction.merchant,
+        "memo": transaction.memo,
+        "photo_reference": transaction.photo_reference,
+        "location": transaction.location,
+        "tags": [str(tag_id) for tag_id in (tags if tags is not None else _tag_state(session, transaction.plan_id, transaction.id))],
+        "source": transaction.source,
+        "source_metadata": transaction.source_metadata,
+        "provenance": transaction.provenance,
+    }
+
+
+def create_transaction(
+    session: Session,
+    *,
+    plan_id: UUID,
+    transaction_id: UUID,
+    payload: TransactionCreate,
+) -> CreationResult[Transaction]:
+    plan = _get_plan(session, plan_id)
+    account = session.scalar(
+        select(Account).where(Account.plan_id == plan_id, Account.id == payload.account_id)
+    )
+    if account is None:
+        raise ResourceNotFound("Account not found")
+    if account.status != "active":
+        raise ArchivedResource("archived Accounts reject new postings")
+    if payload.currency_code != account.currency_code:
+        raise LedgerValidationError("Transaction currency must match Account currency")
+    amount = amount_for_currency(
+        session, payload.amount, account.currency_code, positive=True
+    )
+    event_at = require_aware_timestamp(payload.event_at)
+    category = (
+        _pending_category(session, plan_id)
+        if payload.category_id is None
+        else _require_active_category(session, plan_id, payload.category_id)
+    )
+    tags = _validate_tag_ids(session, plan_id, payload.tags)
+    if payload.type not in {"income", "expense"}:
+        raise LedgerValidationError("only income and expense are public transaction types")
+    canonical = {
+        "plan_id": plan_id,
+        "type": payload.type,
+        "account_id": account.id,
+        "amount": amount,
+        "currency_code": account.currency_code,
+        "event_at": event_at,
+        "category_id": category.id,
+        "merchant": payload.merchant,
+        "memo": payload.memo,
+        "photo_reference": payload.photo_reference,
+        "location": payload.location,
+        "tags": sorted(tags),
+        "source": "manual",
+        "source_metadata": payload.source_metadata,
+        "provenance": payload.provenance,
+    }
+    request_fingerprint = fingerprint(canonical)
+    inserted_id = session.scalar(
+        insert(Transaction)
+        .values(
+            id=transaction_id,
+            plan_id=plan_id,
+            account_id=account.id,
+            type=payload.type,
+            amount=amount,
+            currency_code=account.currency_code,
+            event_at=event_at,
+            category_id=category.id,
+            merchant=payload.merchant,
+            memo=payload.memo,
+            photo_reference=payload.photo_reference,
+            location=payload.location,
+            source="manual",
+            source_metadata=payload.source_metadata,
+            provenance=payload.provenance,
+            creation_fingerprint=request_fingerprint,
+        )
+        .on_conflict_do_nothing()
+        .returning(Transaction.id)
+    )
+    transaction = session.scalar(
+        select(Transaction)
+        .where(Transaction.id == transaction_id)
+        .execution_options(populate_existing=True)
+    )
+    if transaction is None:
+        raise RuntimeError("created Transaction could not be loaded")
+    if transaction.creation_fingerprint != request_fingerprint:
+        raise CreationConflict("Transaction UUID has a different creation payload")
+    if transaction.plan_id != plan_id:
+        raise CreationConflict("Transaction UUID belongs to another Plan")
+    if inserted_id is None:
+        return CreationResult(transaction, False)
+
+    signed_amount = amount if payload.type == "income" else -amount
+    session.add(
+        PostedAccountMovement(
+            id=uuid4(),
+            plan_id=plan_id,
+            account_id=account.id,
+            transaction_id=transaction.id,
+            currency_code=account.currency_code,
+            signed_amount=signed_amount,
+            transaction_type=payload.type,
+            effective_at=event_at,
+            category_id=category.id,
+            merchant=payload.merchant,
+            memo=payload.memo,
+            photo_reference=payload.photo_reference,
+            location=payload.location,
+            source="manual",
+            source_metadata=payload.source_metadata,
+            provenance=payload.provenance,
+            movement_kind="original",
+            correction_sequence=0,
+            posted_at=utc_now(),
+        )
+    )
+    for tag_id in tags:
+        session.add(
+            TransactionTag(
+                id=uuid4(),
+                plan_id=plan_id,
+                transaction_id=transaction.id,
+                tag_id=tag_id,
+                action="attached",
+            )
+        )
+    session.flush()
+    return CreationResult(transaction, True)
+
+
+def list_transactions(session: Session, plan_id: UUID) -> list[Transaction]:
+    _get_plan(session, plan_id)
+    return list(
+        session.scalars(
+            select(Transaction)
+            .where(Transaction.plan_id == plan_id)
+            .order_by(Transaction.event_at.desc(), Transaction.id)
+        )
+    )
+
+
+def get_transaction(session: Session, plan_id: UUID, transaction_id: UUID) -> Transaction:
+    transaction = session.scalar(
+        select(Transaction).where(
+            Transaction.plan_id == plan_id, Transaction.id == transaction_id
+        )
+    )
+    if transaction is None:
+        raise ResourceNotFound("Transaction not found")
+    return transaction
+
+
+def _get_transaction_for_update(
+    session: Session, plan_id: UUID, transaction_id: UUID
+) -> Transaction:
+    transaction = session.scalar(
+        select(Transaction)
+        .where(
+            Transaction.plan_id == plan_id,
+            Transaction.id == transaction_id,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update(of=Transaction)
+    )
+    if transaction is None:
+        raise ResourceNotFound("Transaction not found")
+    return transaction
+
+
+def _current_movement(
+    session: Session,
+    plan_id: UUID,
+    transaction_id: UUID,
+) -> PostedAccountMovement:
+    movement_query = select(PostedAccountMovement).where(
+        PostedAccountMovement.plan_id == plan_id,
+        PostedAccountMovement.transaction_id == transaction_id,
+    )
+    latest_sequence = session.scalar(
+        select(func.coalesce(func.max(TransactionCorrection.correction_sequence), 0)).where(
+            TransactionCorrection.plan_id == plan_id,
+            TransactionCorrection.transaction_id == transaction_id,
+        )
+    ) or 0
+    if latest_sequence:
+        movement_query = movement_query.where(
+            PostedAccountMovement.movement_kind == "replacement",
+            PostedAccountMovement.correction_sequence == latest_sequence,
+        )
+    else:
+        movement_query = movement_query.where(
+            PostedAccountMovement.movement_kind == "original",
+            PostedAccountMovement.correction_sequence == 0,
+        )
+    movement = session.scalar(
+        movement_query
+        .where(
+            PostedAccountMovement.transaction_id == transaction_id,
+        )
+        .limit(1)
+    )
+    if movement is None:
+        raise RuntimeError("Transaction has no effective movement")
+    return movement
+
+
+def _snapshot_from_values(
+    session: Session,
+    *,
+    transaction: Transaction,
+    account_id: UUID,
+    amount: Decimal,
+    currency_code: str,
+    event_at: datetime,
+    category_id: UUID,
+    merchant: str | None,
+    memo: str | None,
+    photo_reference: str | None,
+    location: dict[str, Any] | None,
+    tags: list[UUID],
+    source_metadata: dict[str, Any],
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
+    currency = require_currency(session, currency_code)
+    return {
+        "id": str(transaction.id),
+        "plan_id": str(transaction.plan_id),
+        "account_id": str(account_id),
+        "type": transaction.type,
+        "amount": fixed_amount(amount, currency),
+        "currency_code": currency_code,
+        "event_at": event_at.isoformat(),
+        "category_id": str(category_id),
+        "merchant": merchant,
+        "memo": memo,
+        "photo_reference": photo_reference,
+        "location": location,
+        "tags": [str(tag_id) for tag_id in tags],
+        "source": transaction.source,
+        "source_metadata": source_metadata,
+        "provenance": provenance,
+    }
+
+
+def _correction_payload_matches(
+    session: Session,
+    payload: TransactionCorrectionCreate,
+    after_snapshot: dict[str, Any],
+) -> bool:
+    fields = payload.model_fields_set
+    if "amount" in fields:
+        if payload.amount is None:
+            return False
+        amount = amount_for_currency(
+            session,
+            payload.amount,
+            str(after_snapshot["currency_code"]),
+            positive=True,
+        )
+        if fixed_amount(amount, require_currency(session, str(after_snapshot["currency_code"]))) != after_snapshot["amount"]:
+            return False
+    if "account_id" in fields and str(payload.account_id) != after_snapshot["account_id"]:
+        return False
+    if "category_id" in fields and str(payload.category_id) != after_snapshot["category_id"]:
+        return False
+    if "event_at" in fields:
+        if payload.event_at is None:
+            return False
+        if require_aware_timestamp(payload.event_at).astimezone(timezone.utc) != datetime.fromisoformat(str(after_snapshot["event_at"])).astimezone(timezone.utc):
+            return False
+    for field_name in (
+        "merchant",
+        "memo",
+        "photo_reference",
+        "location",
+    ):
+        if field_name in fields and getattr(payload, field_name) != after_snapshot[field_name]:
+            return False
+    if "tags" in fields:
+        requested_tags = sorted(str(tag_id) for tag_id in (payload.tags or []))
+        if requested_tags != sorted(str(tag_id) for tag_id in after_snapshot["tags"]):
+            return False
+    for field_name in ("source_metadata", "provenance"):
+        if field_name in fields and getattr(payload, field_name) is not None and getattr(payload, field_name) != after_snapshot[field_name]:
+            return False
+    return True
+
+
+def correct_transaction(
+    session: Session,
+    *,
+    plan_id: UUID,
+    transaction_id: UUID,
+    correction_id: UUID,
+    payload: TransactionCorrectionCreate,
+) -> CreationResult[TransactionCorrection]:
+    # This lock is the correction serialization boundary. It deliberately
+    # precedes every snapshot, Tag-state, and effective-movement read.
+    transaction = _get_transaction_for_update(session, plan_id, transaction_id)
+    existing_correction = session.scalar(
+        select(TransactionCorrection).where(TransactionCorrection.id == correction_id)
+    )
+    if existing_correction is not None:
+        if existing_correction.transaction_id != transaction_id:
+            raise CreationConflict("Correction UUID belongs to another Transaction")
+        if _correction_payload_matches(
+            session, payload, existing_correction.after_snapshot
+        ):
+            return CreationResult(existing_correction, False)
+        raise CreationConflict("Correction UUID has a different creation payload")
+
+    before_tags = _tag_state(session, plan_id, transaction_id)
+    before = transaction_snapshot(session, transaction, tags=before_tags)
+    old_movement = _current_movement(session, plan_id, transaction_id)
+    latest_sequence = session.scalar(
+        select(func.coalesce(func.max(TransactionCorrection.correction_sequence), 0)).where(
+            TransactionCorrection.plan_id == plan_id,
+            TransactionCorrection.transaction_id == transaction_id,
+        )
+    ) or 0
+    correction_sequence = int(latest_sequence) + 1
+    fields = payload.model_fields_set
+    current_account = session.scalar(
+        select(Account).where(
+            Account.plan_id == plan_id, Account.id == transaction.account_id
+        )
+    )
+    if current_account is None:
+        raise RuntimeError("Transaction Account could not be loaded")
+    if "account_id" in fields and payload.account_id is None:
+        raise LedgerValidationError("correction account_id cannot be null")
+    target_account_id = (
+        payload.account_id if "account_id" in fields else transaction.account_id
+    )
+    assert target_account_id is not None
+    target_account = session.scalar(
+        select(Account).where(Account.plan_id == plan_id, Account.id == target_account_id)
+    )
+    if target_account is None:
+        raise ResourceNotFound("Account not found")
+    if target_account.status != "active":
+        raise ArchivedResource("archived Accounts reject correction destinations")
+    target_currency = target_account.currency_code
+    if target_currency != transaction.currency_code:
+        raise LedgerValidationError(
+            "correction Account currency must match the Transaction currency"
+        )
+    if "amount" in fields:
+        if payload.amount is None:
+            raise LedgerValidationError("correction amount cannot be null")
+        target_amount = amount_for_currency(
+            session, payload.amount, target_currency, positive=True
+        )
+    else:
+        target_amount = Decimal(transaction.amount)
+    if "category_id" in fields and payload.category_id is None:
+        raise LedgerValidationError("correction category_id cannot be null")
+    target_event_at = (
+        require_aware_timestamp(payload.event_at)
+        if "event_at" in fields and payload.event_at is not None
+        else transaction.event_at
+    )
+    target_category_id = payload.category_id if "category_id" in fields else transaction.category_id
+    assert target_category_id is not None
+    target_category = _get_category(session, plan_id, target_category_id)
+    if target_category.status != "active":
+        raise ArchivedResource("archived Categories reject correction destinations")
+    target_merchant = payload.merchant if "merchant" in fields else transaction.merchant
+    target_memo = payload.memo if "memo" in fields else transaction.memo
+    target_photo = (
+        payload.photo_reference
+        if "photo_reference" in fields
+        else transaction.photo_reference
+    )
+    target_location = payload.location if "location" in fields else transaction.location
+    target_tags = (
+        _validate_tag_ids(session, plan_id, payload.tags or [])
+        if "tags" in fields
+        else before_tags
+    )
+    target_source_metadata = (
+        payload.source_metadata
+        if "source_metadata" in fields and payload.source_metadata is not None
+        else transaction.source_metadata
+    )
+    target_provenance = (
+        payload.provenance
+        if "provenance" in fields and payload.provenance is not None
+        else transaction.provenance
+    )
+    canonical = {
+        "plan_id": plan_id,
+        "transaction_id": transaction_id,
+        "amount": target_amount,
+        "account_id": target_account_id,
+        "currency_code": target_currency,
+        "category_id": target_category.id,
+        "event_at": target_event_at,
+        "merchant": target_merchant,
+        "memo": target_memo,
+        "photo_reference": target_photo,
+        "location": target_location,
+        "tags": sorted(target_tags),
+        "source_metadata": target_source_metadata,
+        "provenance": target_provenance,
+    }
+    request_fingerprint = fingerprint(canonical)
+    after = _snapshot_from_values(
+        session,
+        transaction=transaction,
+        account_id=target_account_id,
+        amount=target_amount,
+        currency_code=target_currency,
+        event_at=target_event_at,
+        category_id=target_category.id,
+        merchant=target_merchant,
+        memo=target_memo,
+        photo_reference=target_photo,
+        location=target_location,
+        tags=target_tags,
+        source_metadata=target_source_metadata,
+        provenance=target_provenance,
+    )
+    inserted_id = session.scalar(
+        insert(TransactionCorrection)
+        .values(
+            id=correction_id,
+            plan_id=plan_id,
+            transaction_id=transaction_id,
+            correction_sequence=correction_sequence,
+            before_snapshot=before,
+            after_snapshot=after,
+            provenance=target_provenance,
+            creation_fingerprint=request_fingerprint,
+        )
+        .on_conflict_do_nothing(index_elements=(TransactionCorrection.id,))
+        .returning(TransactionCorrection.id)
+    )
+    if inserted_id is None:
+        existing_correction = session.scalar(
+            select(TransactionCorrection)
+            .where(TransactionCorrection.id == correction_id)
+            .execution_options(populate_existing=True)
+        )
+        if existing_correction is None:
+            raise RuntimeError("correction creation result could not be loaded")
+        if existing_correction.transaction_id != transaction_id:
+            raise CreationConflict("Correction UUID belongs to another Transaction")
+        if _correction_payload_matches(
+            session, payload, existing_correction.after_snapshot
+        ):
+            return CreationResult(existing_correction, False)
+        raise CreationConflict("Correction UUID has a different creation payload")
+
+    compensation = PostedAccountMovement(
+        id=uuid4(),
+        plan_id=plan_id,
+        account_id=old_movement.account_id,
+        transaction_id=transaction_id,
+        correction_id=correction_id,
+        currency_code=old_movement.currency_code,
+        signed_amount=-Decimal(old_movement.signed_amount),
+        transaction_type=old_movement.transaction_type,
+        effective_at=old_movement.effective_at,
+        category_id=old_movement.category_id,
+        merchant=old_movement.merchant,
+        memo=old_movement.memo,
+        photo_reference=old_movement.photo_reference,
+        location=old_movement.location,
+        source=old_movement.source,
+        source_metadata=old_movement.source_metadata,
+        provenance=old_movement.provenance,
+        movement_kind="compensation",
+        correction_sequence=correction_sequence,
+        posted_at=utc_now(),
+    )
+    new_signed_amount = target_amount if transaction.type == "income" else -target_amount
+    replacement = PostedAccountMovement(
+        id=uuid4(),
+        plan_id=plan_id,
+        account_id=target_account_id,
+        transaction_id=transaction_id,
+        correction_id=correction_id,
+        currency_code=target_currency,
+        signed_amount=new_signed_amount,
+        transaction_type=transaction.type,
+        effective_at=target_event_at,
+        category_id=target_category.id,
+        merchant=target_merchant,
+        memo=target_memo,
+        photo_reference=target_photo,
+        location=target_location,
+        source=transaction.source,
+        source_metadata=target_source_metadata,
+        provenance=target_provenance,
+        movement_kind="replacement",
+        correction_sequence=correction_sequence,
+        posted_at=utc_now(),
+    )
+    session.add_all([compensation, replacement])
+    transaction.account_id = target_account_id
+    transaction.amount = target_amount
+    transaction.currency_code = target_currency
+    transaction.event_at = target_event_at
+    transaction.category_id = target_category.id
+    transaction.merchant = target_merchant
+    transaction.memo = target_memo
+    transaction.photo_reference = target_photo
+    transaction.location = target_location
+    transaction.source_metadata = target_source_metadata
+    transaction.provenance = target_provenance
+    transaction.updated_at = utc_now()
+    for tag_id in sorted(set(before_tags) - set(target_tags)):
+        session.add(
+            TransactionTag(
+                id=uuid4(),
+                plan_id=plan_id,
+                transaction_id=transaction_id,
+                tag_id=tag_id,
+                action="detached",
+                correction_id=correction_id,
+            )
+        )
+    for tag_id in sorted(set(target_tags) - set(before_tags)):
+        session.add(
+            TransactionTag(
+                id=uuid4(),
+                plan_id=plan_id,
+                transaction_id=transaction_id,
+                tag_id=tag_id,
+                action="attached",
+                correction_id=correction_id,
+            )
+        )
+    session.flush()
+    correction = session.scalar(
+        select(TransactionCorrection)
+        .where(TransactionCorrection.id == correction_id)
+        .execution_options(populate_existing=True)
+    )
+    if correction is None:
+        raise RuntimeError("created correction could not be loaded")
+    return CreationResult(correction, True)
+
+
+def list_corrections(
+    session: Session, plan_id: UUID, transaction_id: UUID
+) -> list[TransactionCorrection]:
+    get_transaction(session, plan_id, transaction_id)
+    return list(
+        session.scalars(
+            select(TransactionCorrection)
+            .where(
+                TransactionCorrection.plan_id == plan_id,
+                TransactionCorrection.transaction_id == transaction_id,
+            )
+            .order_by(
+                TransactionCorrection.correction_sequence,
+                TransactionCorrection.id,
+            )
+        )
+    )
+
+
+def create_assignment(
+    session: Session,
+    *,
+    plan_id: UUID,
+    assignment_id: UUID,
+    payload: AssignmentCreate,
+) -> CreationResult[MonthlyBudgetAssignment]:
+    plan = _get_plan(session, plan_id)
+    category = _require_active_category(session, plan_id, payload.category_id)
+    month_key = payload.month_key or payload.month
+    if month_key is None:
+        raise LedgerValidationError("month is required")
+    currency_code = payload.currency_code or plan.reporting_currency_code
+    if currency_code != plan.reporting_currency_code:
+        raise LedgerValidationError("assignment currency must match Plan budget currency")
+    amount = amount_for_currency(session, payload.amount, currency_code, positive=False)
+    request_fingerprint = fingerprint(
+        {
+            "plan_id": plan_id,
+            "category_id": category.id,
+            "month_key": month_key,
+            "amount": amount,
+            "currency_code": currency_code,
+            "source": "manual",
+            "provenance": payload.provenance,
+        }
+    )
+    inserted_id = session.scalar(
+        insert(MonthlyBudgetAssignment)
+        .values(
+            id=assignment_id,
+            plan_id=plan_id,
+            category_id=category.id,
+            month_key=month_key,
+            amount=amount,
+            currency_code=currency_code,
+            source="manual",
+            provenance=payload.provenance,
+            creation_fingerprint=request_fingerprint,
+        )
+        .on_conflict_do_nothing(index_elements=(MonthlyBudgetAssignment.id,))
+        .returning(MonthlyBudgetAssignment.id)
+    )
+    assignment = session.scalar(
+        select(MonthlyBudgetAssignment)
+        .where(MonthlyBudgetAssignment.id == assignment_id)
+        .execution_options(populate_existing=True)
+    )
+    if assignment is None:
+        raise RuntimeError("assignment creation result could not be loaded")
+    if assignment.creation_fingerprint != request_fingerprint:
+        raise CreationConflict("Assignment UUID has a different creation payload")
+    if assignment.plan_id != plan_id:
+        raise CreationConflict("Assignment UUID belongs to another Plan")
+    return CreationResult(assignment, inserted_id is not None)
+
+
+def assignment_response(
+    session: Session, assignment: MonthlyBudgetAssignment
+) -> AssignmentResponse:
+    currency = require_currency(session, assignment.currency_code)
+    return AssignmentResponse.model_validate(
+        {
+            "id": assignment.id,
+            "plan_id": assignment.plan_id,
+            "category_id": assignment.category_id,
+            "month_key": assignment.month_key,
+            "amount": fixed_amount(Decimal(assignment.amount), currency),
+            "currency_code": assignment.currency_code,
+            "source": assignment.source,
+            "provenance": assignment.provenance,
+            "created_at": assignment.created_at,
+        }
+    )
+
+
+def _month_bounds(plan: Plan, month_key: str) -> tuple[datetime, datetime]:
+    try:
+        year = int(month_key[:4])
+        month = int(month_key[5:])
+    except (TypeError, ValueError) as exc:
+        raise LedgerValidationError("month must use YYYY-MM") from exc
+    if len(month_key) != 7 or month_key[4] != "-" or month not in range(1, 13):
+        raise LedgerValidationError("month must use YYYY-MM")
+    zone = ZoneInfo(plan.budget_timezone)
+    start = datetime(year, month, 1, tzinfo=zone)
+    if month == 12:
+        end = datetime(year + 1, 1, 1, tzinfo=zone)
+    else:
+        end = datetime(year, month + 1, 1, tzinfo=zone)
+    return start, end
+
+
+def _budget_movements(
+    session: Session, plan: Plan, month_key: str
+) -> list[PostedAccountMovement]:
+    start, end = _month_bounds(plan, month_key)
+    return list(
+        session.scalars(
+            select(PostedAccountMovement)
+            .where(
+                PostedAccountMovement.plan_id == plan.id,
+                PostedAccountMovement.effective_at >= start,
+                PostedAccountMovement.effective_at < end,
+            )
+            .order_by(PostedAccountMovement.effective_at, PostedAccountMovement.id)
+        )
+    )
+
+
+def _assignment_total(
+    session: Session, plan_id: UUID, month_key: str
+) -> Decimal:
+    result = session.scalar(
+        select(func.coalesce(func.sum(MonthlyBudgetAssignment.amount), 0)).where(
+            MonthlyBudgetAssignment.plan_id == plan_id,
+            MonthlyBudgetAssignment.month_key == month_key,
+        )
+    )
+    return Decimal(result or 0)
+
+
+def _unconverted_summary(
+    session: Session,
+    plan: Plan,
+    movements: Iterable[PostedAccountMovement],
+    *,
+    category_id: UUID | None = None,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for movement in movements:
+        if movement.currency_code == plan.reporting_currency_code:
+            continue
+        if category_id is not None and movement.category_id != category_id:
+            continue
+        if category_id is not None and movement.transaction_type != "expense":
+            continue
+        entry = grouped.setdefault(
+            movement.currency_code,
+            {
+                "currency": movement.currency_code,
+                "income": Decimal(0),
+                "expense": Decimal(0),
+                "amount": Decimal(0),
+                "movement_ids": [],
+                "transaction_ids": [],
+            },
+        )
+        signed = Decimal(movement.signed_amount)
+        entry["amount"] += signed
+        if movement.transaction_type == "income":
+            entry["income"] += signed
+        else:
+            entry["expense"] += signed
+        entry["movement_ids"].append(movement.id)
+        if movement.transaction_id not in entry["transaction_ids"]:
+            entry["transaction_ids"].append(movement.transaction_id)
+    result: list[dict[str, Any]] = []
+    for currency_code, entry in sorted(grouped.items()):
+        currency = require_currency(session, currency_code)
+        result.append(
+            {
+                "currency": currency_code,
+                "income": fixed_amount(entry["income"], currency),
+                "expense": fixed_amount(entry["expense"], currency),
+                "amount": fixed_amount(entry["amount"], currency),
+                "movement_ids": entry["movement_ids"],
+                "transaction_ids": entry["transaction_ids"],
+            }
+        )
+    return result
+
+
+def category_envelope(
+    session: Session, *, plan_id: UUID, month_key: str, category_id: UUID
+) -> dict[str, Any]:
+    plan = _get_plan(session, plan_id)
+    category = _get_category(session, plan_id, category_id)
+    currency = require_currency(session, plan.reporting_currency_code)
+    movements = _budget_movements(session, plan, month_key)
+    assigned = session.scalar(
+        select(func.coalesce(func.sum(MonthlyBudgetAssignment.amount), 0)).where(
+            MonthlyBudgetAssignment.plan_id == plan_id,
+            MonthlyBudgetAssignment.category_id == category_id,
+            MonthlyBudgetAssignment.month_key == month_key,
+        )
+    ) or Decimal(0)
+    activity = sum(
+        (
+            Decimal(movement.signed_amount)
+            for movement in movements
+            if movement.currency_code == plan.reporting_currency_code
+            and movement.category_id == category_id
+            and movement.transaction_type == "expense"
+        ),
+        Decimal(0),
+    )
+    assigned = Decimal(assigned)
+    available = assigned + activity
+    unconverted = _unconverted_summary(
+        session, plan, movements, category_id=category_id
+    )
+    return {
+        "plan_id": plan_id,
+        "category_id": category.id,
+        "month": month_key,
+        "currency": currency.code,
+        "assigned": fixed_amount(assigned, currency),
+        "activity": fixed_amount(activity, currency),
+        "available": fixed_amount(available, currency),
+        "assigned_money": {"amount": fixed_amount(assigned, currency), "currency": currency.code},
+        "activity_money": {"amount": fixed_amount(activity, currency), "currency": currency.code},
+        "available_money": {"amount": fixed_amount(available, currency), "currency": currency.code},
+        "unconverted_by_currency": unconverted,
+    }
+
+
+def monthly_summary(
+    session: Session, *, plan_id: UUID, month_key: str
+) -> dict[str, Any]:
+    plan = _get_plan(session, plan_id)
+    currency = require_currency(session, plan.reporting_currency_code)
+    movements = _budget_movements(session, plan, month_key)
+    income = sum(
+        (
+            Decimal(movement.signed_amount)
+            for movement in movements
+            if movement.currency_code == plan.reporting_currency_code
+            and movement.transaction_type == "income"
+        ),
+        Decimal(0),
+    )
+    assigned_total = _assignment_total(session, plan_id, month_key)
+    activity_total = sum(
+        (
+            Decimal(movement.signed_amount)
+            for movement in movements
+            if movement.currency_code == plan.reporting_currency_code
+            and movement.transaction_type == "expense"
+        ),
+        Decimal(0),
+    )
+    categories = list_categories(session, plan_id)
+    envelopes = [
+        category_envelope(
+            session, plan_id=plan_id, month_key=month_key, category_id=category.id
+        )
+        for category in categories
+    ]
+    ready = income - assigned_total
+    available_total = assigned_total + activity_total
+    return {
+        "plan_id": plan_id,
+        "month": month_key,
+        "currency": currency.code,
+        "ready_to_assign": fixed_amount(ready, currency),
+        "ready_to_assign_money": {"amount": fixed_amount(ready, currency), "currency": currency.code},
+        "assigned_total": fixed_amount(assigned_total, currency),
+        "activity_total": fixed_amount(activity_total, currency),
+        "available_total": fixed_amount(available_total, currency),
+        "unconverted_by_currency": _unconverted_summary(session, plan, movements),
+        "categories": envelopes,
+    }

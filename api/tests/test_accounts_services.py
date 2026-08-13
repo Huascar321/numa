@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 from uuid import uuid4
 
 from app.accounts import Account, Currency, Plan
+from app.ledger import (
+    Category,
+    CategoryGroup,
+    MonthlyBudgetAssignment,
+    PostedAccountMovement,
+    Tag,
+    Transaction,
+    TransactionCorrection,
+    TransactionTag,
+)
 from app.accounts.schemas import PlanCreate
 from app.accounts.service import (
     CreationConflict,
@@ -26,12 +36,18 @@ pytestmark = pytest.mark.postgres
 @pytest.fixture(autouse=True)
 def clean_accounts(postgres_sessions: sessionmaker[Session]):
     with postgres_sessions.begin() as session:
-        session.execute(delete(Account))
-        session.execute(delete(Plan))
+        session.execute(text(
+            "TRUNCATE transaction_tags, posted_account_movements, "
+            "transaction_corrections, monthly_budget_assignments, transactions, "
+            "tags, categories, category_groups, accounts, plans CASCADE"
+        ))
     yield
     with postgres_sessions.begin() as session:
-        session.execute(delete(Account))
-        session.execute(delete(Plan))
+        session.execute(text(
+            "TRUNCATE transaction_tags, posted_account_movements, "
+            "transaction_corrections, monthly_budget_assignments, transactions, "
+            "tags, categories, category_groups, accounts, plans CASCADE"
+        ))
 
 
 def test_currency_service_reads_seeded_scale_metadata(
@@ -68,6 +84,7 @@ def test_plan_create_replay_after_rename_returns_current_plan(
     original_payload = PlanCreate(
         name="Original Plan",
         reporting_currency_code="BOB",
+        budget_timezone="America/La_Paz",
     )
     with postgres_sessions.begin() as session:
         first = create_plan(session, plan_id=plan_id, payload=original_payload)
@@ -99,7 +116,11 @@ def test_plan_conflicting_replay_leaves_original_unchanged(
         created = create_plan(
             session,
             plan_id=plan_id,
-            payload=PlanCreate(name="Original", reporting_currency_code="BOB"),
+            payload=PlanCreate(
+                name="Original",
+                reporting_currency_code="BOB",
+                budget_timezone="America/La_Paz",
+            ),
         ).resource
         original_state = (
             created.name,
@@ -113,7 +134,11 @@ def test_plan_conflicting_replay_leaves_original_unchanged(
             create_plan(
                 session,
                 plan_id=plan_id,
-                payload=PlanCreate(name="Different", reporting_currency_code="USDT"),
+                payload=PlanCreate(
+                    name="Different",
+                    reporting_currency_code="USDT",
+                    budget_timezone="America/La_Paz",
+                ),
             )
 
     with postgres_sessions() as session:
@@ -136,7 +161,11 @@ def test_plan_service_rejects_unknown_currency_and_unknown_plan(
             create_plan(
                 session,
                 plan_id=plan_id,
-                payload=PlanCreate(name="Plan", reporting_currency_code="USD"),
+                payload=PlanCreate(
+                    name="Plan",
+                    reporting_currency_code="USD",
+                    budget_timezone="America/La_Paz",
+                ),
             )
 
     with postgres_sessions() as session:
