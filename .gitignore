@@ -7,6 +7,7 @@ __pycache__/
 api/.venv/
 web/dist/
 web/node_modules/
+web/*.tsbuildinfo
 /emails/
 /bank_statements/
 /extracto-bg-*.csv

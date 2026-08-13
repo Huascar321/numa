@@ -12,6 +12,7 @@ from app.settings import Settings
 
 
 INITIAL_REVISION = "001_foundation"
+EXPECTED_REVISION = "002_accounts"
 
 
 class Base(DeclarativeBase):
@@ -52,6 +53,6 @@ def database_is_ready(settings: Settings) -> bool:
         with engine_for(settings.database_url).connect() as connection:
             connection.execute(text("SELECT 1"))
             revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
-            return revision == INITIAL_REVISION
+            return revision == EXPECTED_REVISION
     except Exception:
         return False

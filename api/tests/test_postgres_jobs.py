@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, inspect, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.db import INITIAL_REVISION, engine_for
+from app.db import EXPECTED_REVISION, engine_for
 from app.jobs import (
     IdempotencyConflict,
     Job,
@@ -93,7 +93,7 @@ def test_migration_creates_expected_job_schema(
 
     with engine.connect() as connection:
         context = MigrationContext.configure(connection)
-        assert context.get_current_revision() == INITIAL_REVISION
+        assert context.get_current_revision() == EXPECTED_REVISION
 
 
 def test_readiness_succeeds_at_expected_revision(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI, Response, status
 
+from app.accounts.routes import router as accounts_router
 from app.db import database_is_ready
 from app.settings import Settings
 
@@ -9,6 +10,7 @@ from app.settings import Settings
 def create_app(settings: Settings | None = None) -> FastAPI:
     application = FastAPI(title="Numa API")
     application.state.settings = settings or Settings()
+    application.include_router(accounts_router)
 
     @application.get("/health/live")
     def live() -> dict[str, str]:
