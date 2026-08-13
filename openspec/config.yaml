@@ -1,0 +1,14 @@
+schema: spec-driven
+context: project-context.md
+rules:
+  proposal: Follow AGENT_RULES.md.
+  design: Follow AGENT_RULES.md.
+  tasks: Follow AGENT_RULES.md.
+  spec: Follow AGENT_RULES.md.
+artifacts:
+  main_specs: specs/<capability>/spec.md
+  change_artifacts: changes/<ordered-change>/
+  policy: Main specs state target truth; changes are ordered implementation evidence and are not edited retroactively.
+requirements:
+  normative_keywords: [MUST, SHOULD, FUTURE, OPTIONAL]
+  scenario_format: "#### Scenario: <name> followed by GIVEN/WHEN/THEN"
