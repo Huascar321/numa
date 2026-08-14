@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from app.accounts.models import Account
 from app.accounts.schemas import BalanceResponse
 from app.accounts.service import account_balance, get_account
 from app.db import session_scope
-from app.ledger.models import Category, CategoryGroup, MonthlyBudgetAssignment, Tag, Transaction, TransactionCorrection
+from app.ledger.models import Category, CategoryGroup, MonthlyBudgetAssignment, Tag, Transaction, TransactionCorrection, Transfer, TransferLeg, PostedAccountMovement
 from app.ledger.schemas import (
     AssignmentCreate,
     AssignmentResponse,
@@ -29,6 +31,9 @@ from app.ledger.schemas import (
     TransactionCorrectionResponse,
     TransactionCreate,
     TransactionResponse,
+    TransferCreate,
+    TransferReversalCreate,
+    TransferResponse,
 )
 from app.ledger.service import (
     ArchivedResource,
@@ -58,8 +63,13 @@ from app.ledger.service import (
     patch_category_group,
     patch_tag,
     transaction_snapshot,
+    create_transfer,
+    get_transfer,
+    list_transfers,
+    reverse_transfer,
 )
-from app.accounts.service import CreationConflict, ResourceNotFound
+from app.accounts.service import CreationConflict, ResourceNotFound, require_currency
+from app.ledger.service import fixed_amount
 
 
 router = APIRouter(tags=["ledger"])
@@ -98,6 +108,7 @@ def _tag_response(tag: Tag) -> TagResponse:
 
 def _transaction_response(session: Session, transaction: Transaction) -> TransactionResponse:
     snapshot = transaction_snapshot(session, transaction)
+    leg = session.scalar(select(TransferLeg).where(TransferLeg.plan_id == transaction.plan_id, TransferLeg.transaction_id == transaction.id))
     return TransactionResponse.model_validate(
         {
             **snapshot,
@@ -105,6 +116,8 @@ def _transaction_response(session: Session, transaction: Transaction) -> Transac
             "currency_code": transaction.currency_code,
             "created_at": transaction.created_at,
             "updated_at": transaction.updated_at,
+            "transfer_id": leg.transfer_id if leg else None,
+            "transfer_role": leg.role if leg else None,
         }
     )
 
@@ -124,6 +137,26 @@ def _correction_response(correction: TransactionCorrection) -> TransactionCorrec
     )
 
 
+def _transfer_response(session: Session, transfer: Transfer) -> TransferResponse:
+    legs: list[dict[str, object]] = []
+    for leg in session.scalars(select(TransferLeg).where(TransferLeg.plan_id == transfer.plan_id, TransferLeg.transfer_id == transfer.id).order_by((TransferLeg.role == "outbound").desc())):
+        movement = session.scalar(select(PostedAccountMovement).where(PostedAccountMovement.plan_id == transfer.plan_id, PostedAccountMovement.transaction_id == leg.transaction_id, PostedAccountMovement.movement_kind == "original"))
+        if movement is None:
+            raise RuntimeError("Transfer leg has no movement")
+        legs.append({"id": leg.id, "role": leg.role, "transaction_id": leg.transaction_id, "movement_id": movement.id})
+    outbound_currency = require_currency(session, transfer.outbound_currency_code)
+    inbound_currency = require_currency(session, transfer.inbound_currency_code)
+    result: dict[str, object] = {"id": transfer.id, "plan_id": transfer.plan_id, "source_account_id": transfer.source_account_id,
+        "destination_account_id": transfer.destination_account_id, "outbound_amount": fixed_amount(Decimal(transfer.outbound_amount), outbound_currency),
+        "outbound_currency_code": transfer.outbound_currency_code, "inbound_amount": fixed_amount(Decimal(transfer.inbound_amount), inbound_currency),
+        "inbound_currency_code": transfer.inbound_currency_code, "event_at": transfer.event_at, "rate": format(Decimal(transfer.rate), "f"),
+        "memo": transfer.memo, "reversal_reason": transfer.reversal_reason, "provenance": transfer.provenance,
+        "reverses_transfer_id": transfer.reverses_transfer_id, "created_at": transfer.created_at, "legs": legs}
+    if transfer.outbound_currency_code != transfer.inbound_currency_code:
+        result["rate_source"] = transfer.rate_source
+    return TransferResponse.model_validate(result)
+
+
 @router.get(
     "/plans/{plan_id}/accounts/{account_id}/balance",
     response_model=BalanceResponse,
@@ -138,6 +171,58 @@ def get_account_balance(
         return account_balance(session, account)
     except ResourceNotFound as exc:
         raise _not_found(exc) from exc
+
+
+@router.put("/plans/{plan_id}/transfers/{transfer_id}", response_model=TransferResponse, response_model_exclude_none=True, status_code=status.HTTP_201_CREATED)
+def put_transfer(plan_id: UUID, transfer_id: UUID, payload: TransferCreate, response: Response,
+                 session: Session = Depends(get_database_session)) -> TransferResponse:
+    try:
+        with session.begin():
+            result = create_transfer(session, plan_id=plan_id, transfer_id=transfer_id, payload=payload)
+            body = _transfer_response(session, result.resource)
+    except CreationConflict as exc:
+        raise _conflict(exc) from exc
+    except ResourceNotFound as exc:
+        raise _not_found(exc) from exc
+    except LedgerValidationError as exc:
+        raise _invalid(exc) from exc
+    if not result.created:
+        response.status_code = status.HTTP_200_OK
+    return body
+
+
+@router.get("/plans/{plan_id}/transfers", response_model=list[TransferResponse], response_model_exclude_none=True)
+def get_transfers(plan_id: UUID, session: Session = Depends(get_database_session)) -> list[TransferResponse]:
+    try:
+        return [_transfer_response(session, item) for item in list_transfers(session, plan_id)]
+    except ResourceNotFound as exc:
+        raise _not_found(exc) from exc
+
+
+@router.get("/plans/{plan_id}/transfers/{transfer_id}", response_model=TransferResponse, response_model_exclude_none=True)
+def get_transfer_route(plan_id: UUID, transfer_id: UUID, session: Session = Depends(get_database_session)) -> TransferResponse:
+    try:
+        return _transfer_response(session, get_transfer(session, plan_id, transfer_id))
+    except ResourceNotFound as exc:
+        raise _not_found(exc) from exc
+
+
+@router.put("/plans/{plan_id}/transfers/{transfer_id}/reversals/{reversal_id}", response_model=TransferResponse, response_model_exclude_none=True, status_code=status.HTTP_201_CREATED)
+def put_transfer_reversal(plan_id: UUID, transfer_id: UUID, reversal_id: UUID, payload: TransferReversalCreate,
+                          response: Response, session: Session = Depends(get_database_session)) -> TransferResponse:
+    try:
+        with session.begin():
+            result = reverse_transfer(session, plan_id=plan_id, transfer_id=transfer_id, reversal_id=reversal_id, payload=payload)
+            body = _transfer_response(session, result.resource)
+    except CreationConflict as exc:
+        raise _conflict(exc) from exc
+    except ResourceNotFound as exc:
+        raise _not_found(exc) from exc
+    except LedgerValidationError as exc:
+        raise _invalid(exc) from exc
+    if not result.created:
+        response.status_code = status.HTTP_200_OK
+    return body
 
 
 @router.put(
@@ -432,12 +517,12 @@ def put_transaction(
     return transaction_response
 
 
-@router.get("/plans/{plan_id}/transactions", response_model=list[TransactionResponse])
+@router.get("/plans/{plan_id}/transactions", response_model=list[TransactionResponse | TransferResponse], response_model_exclude_none=True)
 def get_transactions(
     plan_id: UUID, session: Session = Depends(get_database_session)
-) -> list[TransactionResponse]:
+) -> list[TransactionResponse | TransferResponse]:
     try:
-        return [_transaction_response(session, item) for item in list_transactions(session, plan_id)]
+        return [_transfer_response(session, item) if isinstance(item, Transfer) else _transaction_response(session, item) for item in list_transactions(session, plan_id)]
     except ResourceNotFound as exc:
         raise _not_found(exc) from exc
 

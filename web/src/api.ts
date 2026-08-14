@@ -74,11 +74,11 @@ export type Transaction = {
   id: string;
   plan_id: string;
   account_id: string;
-  type: "income" | "expense";
+  type: "income" | "expense" | "transfer";
   amount: string;
   currency_code: string;
   event_at: string;
-  category_id: string;
+  category_id: string | null;
   merchant: string | null;
   memo: string | null;
   photo_reference: string | null;
@@ -90,6 +90,17 @@ export type Transaction = {
   created_at: string;
   updated_at: string;
 };
+
+export type Transfer = {
+  id: string; plan_id: string; source_account_id: string; destination_account_id: string;
+  outbound_amount: string; outbound_currency_code: string; inbound_amount: string; inbound_currency_code: string;
+  event_at: string; rate: string; rate_source?: string; memo: string | null; reversal_reason: string | null;
+  provenance: Record<string, unknown>; reverses_transfer_id: string | null;
+  created_at: string;
+  legs: { id: string; role: "outbound" | "inbound"; transaction_id: string; movement_id: string }[];
+};
+
+export type PlanActivityItem = Transaction | Transfer;
 
 export type TransactionCorrection = {
   id: string;
@@ -284,8 +295,16 @@ export function archiveTag(planId: string, tagId: string): Promise<Tag> {
   });
 }
 
-export function getTransactions(planId: string): Promise<Transaction[]> {
-  return request<Transaction[]>(`/plans/${planId}/transactions`);
+export function getTransactions(planId: string): Promise<PlanActivityItem[]> {
+  return request<PlanActivityItem[]>(`/plans/${planId}/transactions`);
+}
+
+export function getTransfers(planId: string): Promise<Transfer[]> { return request<Transfer[]>(`/plans/${planId}/transfers`); }
+export function createTransfer(planId: string, transferId: string, payload: Record<string, unknown>): Promise<Transfer> {
+  return request<Transfer>(`/plans/${planId}/transfers/${transferId}`, { method: "PUT", body: JSON.stringify(payload) });
+}
+export function reverseTransfer(planId: string, transferId: string, reversalId: string, payload: Record<string, unknown>): Promise<Transfer> {
+  return request<Transfer>(`/plans/${planId}/transfers/${transferId}/reversals/${reversalId}`, { method: "PUT", body: JSON.stringify(payload) });
 }
 
 export type TransactionCreatePayload = {

@@ -1,24 +1,7 @@
-# Analytics Specification
+# Analytics delta
 
-## Purpose
-Provide plan-scoped financial reporting with explicit period, currency, and
-transfer-treatment boundaries for reliable interpretation.
+## MODIFIED Requirements
 
-## Scope
-Income, expense, net, balances, comparisons, categories, merchants, tags, trends, heatmaps, and goal status.
-
-## Business rules
-Analytics MUST be Plan and period scoped. Transfers MUST be excluded from income and expense. Unconverted values MUST be explicit rather than silently aggregated.
-
-## Data model
-Report query, period, plan, metric, currency state, grouping, and result.
-
-## Constraints
-Reporting MUST use the Plan reporting currency only when authorized conversion exists.
-
-## Non-goals
-Cross-plan or silent FX aggregation is a non-goal.
-## Requirements
 ### Requirement: Explicit reporting boundaries
 Analytics MUST classify Transfer roots and legs as transfers and exclude both
 legs, including cross-currency and reversal legs, from income, expense, and net
@@ -36,6 +19,3 @@ conversion implementation.
 - **GIVEN** a reporting period contains income, expense, and a cross-currency Transfer
 - **WHEN** analytics income, expense, and net totals are calculated
 - **THEN** only the income and expense movements affect those totals, while the Transfer remains separately identifiable as a grouped excluded operation.
-
-## Acceptance criteria
-Requested metrics are available within stated plan, period, and currency boundaries.

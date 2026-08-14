@@ -166,11 +166,11 @@ class TransactionResponse(BaseModel):
     id: UUID
     plan_id: UUID
     account_id: UUID
-    type: Literal["income", "expense"]
+    type: Literal["income", "expense", "transfer"]
     amount: StrictStr
     currency_code: str
     event_at: datetime
-    category_id: UUID
+    category_id: UUID | None
     merchant: str | None
     memo: str | None
     photo_reference: str | None
@@ -181,6 +181,67 @@ class TransactionResponse(BaseModel):
     provenance: dict[str, Any]
     created_at: datetime
     updated_at: datetime
+    transfer_id: UUID | None = None
+    transfer_role: Literal["outbound", "inbound"] | None = None
+
+
+class TransferCreate(StrictRequest):
+    source_account_id: UUID
+    destination_account_id: UUID
+    outbound_amount: StrictStr
+    inbound_amount: StrictStr
+    event_at: datetime
+    rate_source: StrictStr | None = None
+    memo: StrictStr | None = None
+    provenance: dict[str, Any]
+
+    @field_validator("event_at")
+    @classmethod
+    def aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("event_at must include a timezone offset")
+        return value
+
+
+class TransferReversalCreate(StrictRequest):
+    event_at: datetime
+    reversal_reason: StrictStr
+    memo: StrictStr | None = None
+    provenance: dict[str, Any]
+
+    @field_validator("event_at")
+    @classmethod
+    def aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("event_at must include a timezone offset")
+        return value
+
+
+class TransferLegResponse(BaseModel):
+    id: UUID
+    role: Literal["outbound", "inbound"]
+    transaction_id: UUID
+    movement_id: UUID
+
+
+class TransferResponse(BaseModel):
+    id: UUID
+    plan_id: UUID
+    source_account_id: UUID
+    destination_account_id: UUID
+    outbound_amount: StrictStr
+    outbound_currency_code: str
+    inbound_amount: StrictStr
+    inbound_currency_code: str
+    event_at: datetime
+    rate: StrictStr
+    memo: str | None
+    reversal_reason: str | None
+    provenance: dict[str, Any]
+    reverses_transfer_id: UUID | None
+    created_at: datetime
+    legs: list[TransferLegResponse]
+    rate_source: str | None = None
 
 
 class AssignmentCreate(StrictRequest):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from hashlib import sha256
 import json
 from typing import Generic, TypeVar, cast
@@ -291,7 +291,15 @@ def account_balance(session: Session, account: Account) -> BalanceResponse:
             PostedAccountMovement.currency_code == account.currency_code,
         )
     ) or Decimal(0)
-    amount = Decimal(amount).quantize(scale)
+    amount = Decimal(amount)
+    # PostgreSQL SUM may have more significant digits than Decimal's default
+    # context.  Derive the precision from the actual accumulated value and the
+    # currency scale so exact posted amounts are never rounded or rejected.
+    integer_digits = max(amount.adjusted() + 1, 1) if amount else 1
+    precision = max(len(amount.as_tuple().digits), integer_digits + currency.decimal_places, currency.decimal_places + 1)
+    with localcontext() as context:
+        context.prec = precision
+        amount = amount.quantize(scale)
     return BalanceResponse(
         amount=format(amount, "f"),
         currency=currency.code,

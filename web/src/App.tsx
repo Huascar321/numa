@@ -48,6 +48,10 @@ import {
   renameTag,
   correctTransaction,
   getTransactionCorrections,
+  Transfer,
+  getTransfers,
+  createTransfer,
+  reverseTransfer,
 } from "./api";
 
 function ErrorMessage({ message }: { message: string }) {
@@ -470,7 +474,8 @@ function TransactionPanel({ planId, accounts, categories }: { planId: string; ac
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [correctionAmount, setCorrectionAmount] = useState("");
-  const selected = transactions.data?.find((transaction) => transaction.id === selectedId) ?? null;
+  const ordinaryTransactions = (transactions.data ?? []).filter((item): item is Transaction => !("legs" in item));
+  const selected = ordinaryTransactions.find((transaction) => transaction.id === selectedId) ?? null;
   useEffect(() => {
     if (!accountId && accounts[0]) setAccountId(accounts[0].id);
   }, [accountId, accounts]);
@@ -527,7 +532,7 @@ function TransactionPanel({ planId, accounts, categories }: { planId: string; ac
         <button type="submit" disabled={postMutation.isPending || !accountId}>{postMutation.isPending ? "Posting…" : "Post"}</button>
       </form>
       {postMutation.isError && <ErrorMessage message={postMutation.error.message} />}
-       <div className="card-list">{transactions.data?.map((transaction) => <article className="card" key={transaction.id}><strong>{transaction.type} {transaction.amount} {transaction.currency_code}</strong><p>{transaction.merchant || "No merchant"} · {transaction.memo || "No memo"}</p><button type="button" onClick={() => { setSelectedId(transaction.id); setCorrectionAmount(transaction.amount); }}>View detail and correct</button>{selected?.id === transaction.id && <><div className="transaction-detail"><p>Account {transaction.account_id}</p><p>Category {categories.find((category) => category.id === transaction.category_id)?.name ?? transaction.category_id}</p><p>Event {transaction.event_at}</p></div><form className="inline-form" onSubmit={(event) => { event.preventDefault(); correctionMutation.mutate(); }}><label>Replacement amount<input value={correctionAmount} onChange={(event) => setCorrectionAmount(event.target.value)} required /></label><button type="submit" disabled={correctionMutation.isPending}>{correctionMutation.isPending ? "Saving…" : "Save correction"}</button><button type="button" onClick={() => setSelectedId(null)}>Close</button></form><div><strong>Correction history</strong>{corrections.isPending && <p>Loading correction history…</p>}{corrections.data?.map((correction) => <p key={correction.id}>#{correction.correction_sequence}: {String(correction.before_snapshot.amount)} → {String(correction.after_snapshot.amount)}</p>)}</div></>}</article>)}</div>
+        <div className="card-list">{ordinaryTransactions.map((transaction) => <article className="card" key={transaction.id}><strong>{transaction.type} {transaction.amount} {transaction.currency_code}</strong><p>{transaction.merchant || "No merchant"} · {transaction.memo || "No memo"}</p><button type="button" onClick={() => { setSelectedId(transaction.id); setCorrectionAmount(transaction.amount); }}>View detail and correct</button>{selected?.id === transaction.id && <><div className="transaction-detail"><p>Account {transaction.account_id}</p><p>Category {categories.find((category) => category.id === transaction.category_id)?.name ?? transaction.category_id}</p><p>Event {transaction.event_at}</p></div><form className="inline-form" onSubmit={(event) => { event.preventDefault(); correctionMutation.mutate(); }}><label>Replacement amount<input value={correctionAmount} onChange={(event) => setCorrectionAmount(event.target.value)} required /></label><button type="submit" disabled={correctionMutation.isPending}>{correctionMutation.isPending ? "Saving…" : "Save correction"}</button><button type="button" onClick={() => setSelectedId(null)}>Close</button></form><div><strong>Correction history</strong>{corrections.isPending && <p>Loading correction history…</p>}{corrections.data?.map((correction) => <p key={correction.id}>#{correction.correction_sequence}: {String(correction.before_snapshot.amount)} → {String(correction.after_snapshot.amount)}</p>)}</div></>}</article>)}</div>
     </section>
   );
 }
@@ -542,12 +547,71 @@ function BudgetPanel({ planId, categories }: { planId: string; categories: Categ
   return <section className="panel" aria-labelledby="budget-heading"><h2 id="budget-heading">Budget month</h2><label>Month<input type="month" value={month} onChange={(event) => setMonth(event.target.value)} /></label>{summary.data && <><p>Ready to Assign <strong>{summary.data.ready_to_assign} {summary.data.currency}</strong></p><form className="inline-form" onSubmit={(event) => { event.preventDefault(); assignment.mutate(); }}><label>Category<select value={categoryId} onChange={(event) => setCategoryId(event.target.value)} required><option value="">Select category</option>{categories.filter((category) => category.status === "active").map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></label><label>Assignment (exact decimal string)<input value={amount} onChange={(event) => setAmount(event.target.value)} required /></label><button type="submit">Assign</button></form><div className="card-list">{summary.data.categories.map((envelope) => <article className="card" key={envelope.category_id}><strong>{categories.find((category) => category.id === envelope.category_id)?.name}</strong><p>Assigned {envelope.assigned} · Activity {envelope.activity} · Available {envelope.available} {envelope.currency}</p>{envelope.unconverted_by_currency.map((item) => <p key={item.currency} className="unconverted">Unconverted {item.currency}: {item.amount}</p>)}</article>)}</div>{summary.data.unconverted_by_currency.map((item) => <p className="unconverted" key={item.currency}>Unconverted {item.currency}: {item.amount}</p>)}</>}</section>;
 }
 
+function TransferPanel({ planId, accounts }: { planId: string; accounts: Account[] }) {
+  const queryClient = useQueryClient();
+  const currencies = useCurrencies();
+  const transfers = useQuery({ queryKey: ["plans", planId, "transfers"], queryFn: () => getTransfers(planId) });
+  const active = accounts.filter((account) => account.status === "active");
+  const [source, setSource] = useState(active[0]?.id ?? "");
+  const [destination, setDestination] = useState(active[1]?.id ?? "");
+  const [outbound, setOutbound] = useState(""); const [inbound, setInbound] = useState("");
+  const [eventAt, setEventAt] = useState(new Date().toISOString().slice(0, 16));
+  const [rateSource, setRateSource] = useState(""); const [memo, setMemo] = useState("");
+  const [reversalReason, setReversalReason] = useState("");
+  const [reversalAt, setReversalAt] = useState(new Date().toISOString().slice(0, 16));
+  const sourceAccount = active.find((item) => item.id === source); const destinationAccount = active.find((item) => item.id === destination);
+  useEffect(() => {
+    if (!active.some((account) => account.id === source)) setSource(active[0]?.id ?? "");
+    if (!active.some((account) => account.id === destination) || destination === source) setDestination(active.find((account) => account.id !== source)?.id ?? "");
+  }, [active, source, destination]);
+  const cross = Boolean(sourceAccount && destinationAccount && sourceAccount.currency_code !== destinationAccount.currency_code);
+  const validateAmount = (value: string, account: Account | undefined) => {
+    const places = currencies.data?.find((currency) => currency.code === account?.currency_code)?.decimal_places;
+    const [whole, fraction = ""] = value.split(".");
+    const positive = /^\d+(?:\.\d+)?$/.test(value) && /[1-9]/.test(`${whole}${fraction}`);
+    if (!account || places === undefined || !positive || fraction.length > places) throw new Error("Use a positive exact amount at the selected Account currency scale.");
+  };
+  const refresh = async () => { await Promise.all([queryClient.invalidateQueries({ queryKey: ["plans", planId, "transactions"] }), queryClient.invalidateQueries({ queryKey: ["plans", planId, "transfers"] }), queryClient.invalidateQueries({ queryKey: ["plans", planId, "accounts"] }), queryClient.invalidateQueries({ queryKey: ["plans", planId, "budget"] })]); };
+  const create = useMutation({ mutationFn: () => { validateAmount(outbound, sourceAccount); validateAmount(inbound, destinationAccount); if (!cross && outbound !== inbound) throw new Error("Same-currency originals must match exactly."); if (cross && !rateSource.trim()) throw new Error("Cross-currency transfers require rate-source evidence."); return createTransfer(planId, newClientId(), { source_account_id: source, destination_account_id: destination, outbound_amount: outbound, inbound_amount: inbound, event_at: new Date(eventAt).toISOString(), ...(cross ? { rate_source: rateSource } : {}), memo: memo || null, provenance: {} }); }, onSuccess: refresh });
+  const reversal = useMutation({ mutationFn: (transfer: Transfer) => { if (!reversalReason.trim()) throw new Error("A reversal reason is required."); return reverseTransfer(planId, transfer.id, newClientId(), { event_at: new Date(reversalAt).toISOString(), reversal_reason: reversalReason, memo: null, provenance: {} }); }, onSuccess: refresh });
+  return (
+    <section className="panel" aria-labelledby="transfers-heading">
+      <h2 id="transfers-heading">Transfers</h2>
+      {active.length < 2 ? <p className="field-help">Create two active Accounts to make a Transfer.</p> : <form className="form-grid" onSubmit={(event) => { event.preventDefault(); create.mutate(); }}>
+        <label>From<select value={source} onChange={(event) => setSource(event.target.value)}>{active.map((account) => <option key={account.id} value={account.id}>{account.name} · {account.currency_code}</option>)}</select></label>
+        <label>To<select value={destination} onChange={(event) => setDestination(event.target.value)}>{active.filter((account) => account.id !== source).map((account) => <option key={account.id} value={account.id}>{account.name} · {account.currency_code}</option>)}</select></label>
+        <label>Sent (exact)<input required value={outbound} onChange={(event) => setOutbound(event.target.value)} /></label>
+        <label>Received (exact)<input required value={inbound} onChange={(event) => setInbound(event.target.value)} /></label>
+        <label>Timestamp<input type="datetime-local" required value={eventAt} onChange={(event) => setEventAt(event.target.value)} /></label>
+        {cross ? <label>Rate source evidence<input required value={rateSource} onChange={(event) => setRateSource(event.target.value)} /></label> : <p className="field-help">Same currency amounts must match; rate is exactly 1 and has no source.</p>}
+        <label>Memo<input value={memo} onChange={(event) => setMemo(event.target.value)} /></label>
+        {cross ? <p className="field-help">Evidence: {outbound || "sent"} {sourceAccount?.currency_code} / {inbound || "received"} {destinationAccount?.currency_code}</p> : null}
+        <button disabled={create.isPending || !source || !destination || source === destination}>{create.isPending ? "Posting…" : "Create Transfer"}</button>
+      </form>}
+      {create.isError ? <ErrorMessage message={create.error.message} /> : null}
+      <div className="card-list">{transfers.data?.map((transfer) => (
+        <article className="card" key={transfer.id}>
+          <strong>Transfer {transfer.outbound_amount} {transfer.outbound_currency_code} → {transfer.inbound_amount} {transfer.inbound_currency_code}</strong>
+          <p>Event {transfer.event_at}</p>
+          <p>From {accounts.find((account) => account.id === transfer.source_account_id)?.name ?? transfer.source_account_id} ({transfer.source_account_id}) to {accounts.find((account) => account.id === transfer.destination_account_id)?.name ?? transfer.destination_account_id} ({transfer.destination_account_id})</p>
+          <p>Rate {transfer.rate}{transfer.rate_source ? ` · ${transfer.rate_source}` : ""}</p>
+          <p>{transfer.memo || "No memo"} · {transfer.legs.map((leg) => `${leg.role} leg ${leg.id}, transaction ${leg.transaction_id}, movement ${leg.movement_id}`).join("; ")}</p>
+          {transfer.reversal_reason ? <p>Reversal reason: {transfer.reversal_reason}</p> : null}
+          {transfer.reverses_transfer_id ? <p>Reverses transfer {transfer.reverses_transfer_id}</p> : null}
+          {!transfer.reverses_transfer_id ? <div className="inline-form"><label>Reversal timestamp<input type="datetime-local" value={reversalAt} onChange={(event) => setReversalAt(event.target.value)} /></label><label>Reversal reason<input value={reversalReason} onChange={(event) => setReversalReason(event.target.value)} required /></label><button type="button" disabled={reversal.isPending} onClick={() => reversal.mutate(transfer)}>Reverse transfer</button></div> : null}
+        </article>
+      ))}</div>
+      {reversal.isError ? <ErrorMessage message={reversal.error.message} /> : null}
+    </section>
+  );
+}
+
 function LedgerScreen() {
   const { planId } = useParams<{ planId: string }>();
   const accounts = useQuery({ queryKey: ["plans", planId, "accounts"], queryFn: () => getAccounts(planId ?? ""), enabled: Boolean(planId) });
   const categories = useQuery({ queryKey: ["plans", planId, "categories"], queryFn: () => getCategories(planId ?? ""), enabled: Boolean(planId) });
   if (!planId) return <Navigate to="/plans" replace />;
-  return <main className="page"><header className="page-header"><Link to={`/plans/${planId}/accounts`}>← Accounts</Link><p className="eyebrow">Ledger core</p><h1>Ledger</h1><p>Exact, Plan-scoped activity and monthly envelopes.</p></header><TaxonomyPanel planId={planId} /><TransactionPanel planId={planId} accounts={accounts.data ?? []} categories={categories.data ?? []} /><BudgetPanel planId={planId} categories={categories.data ?? []} /></main>;
+  return <main className="page"><header className="page-header"><Link to={`/plans/${planId}/accounts`}>← Accounts</Link><p className="eyebrow">Ledger</p><h1>Ledger</h1><p>Exact, Plan-scoped activity and monthly envelopes.</p></header><TaxonomyPanel planId={planId} /><TransactionPanel planId={planId} accounts={accounts.data ?? []} categories={categories.data ?? []} /><TransferPanel planId={planId} accounts={accounts.data ?? []} /><BudgetPanel planId={planId} categories={categories.data ?? []} /></main>;
 }
 
 export function AppRoutes() {

@@ -40,7 +40,7 @@ pytestmark = pytest.mark.postgres
 @pytest.fixture(autouse=True)
 def clean_ledger(postgres_sessions: sessionmaker[Session]):
     statement = text(
-        "TRUNCATE transaction_tags, posted_account_movements, "
+        "TRUNCATE transfer_legs, transfers, transaction_tags, posted_account_movements, "
         "transaction_corrections, monthly_budget_assignments, transactions, "
         "tags, categories, category_groups, accounts, plans CASCADE"
     )
@@ -931,5 +931,8 @@ def test_month_boundaries_assignments_dst_and_unconverted_reporting(client: Test
 def test_no_forbidden_ledger_capabilities(client: TestClient) -> None:
     paths = client.get("/openapi.json").json()["paths"]
     assert all("delete" not in operations for operations in paths.values())
-    forbidden = ("transfer", "cleared", "reconciliation", "rollover", "goal", "target", "fx")
+    assert "/plans/{plan_id}/transfers/{transfer_id}" in paths
+    assert "/plans/{plan_id}/transfers" in paths
+    assert "/plans/{plan_id}/transfers/{transfer_id}/reversals/{reversal_id}" in paths
+    forbidden = ("cleared", "reconciliation", "rollover", "goal", "target", "fx")
     assert not any(any(word in path.lower() for word in forbidden) for path in paths)

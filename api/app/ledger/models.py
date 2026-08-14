@@ -152,7 +152,7 @@ class Transaction(Base):
     __tablename__ = "transactions"
     __table_args__ = (
         CheckConstraint(
-            "type IN ('income', 'expense')", name="ck_transactions_type"
+            "type IN ('income', 'expense', 'transfer')", name="ck_transactions_type"
         ),
         CheckConstraint("amount > 0", name="ck_transactions_amount_positive"),
         CheckConstraint(
@@ -203,7 +203,7 @@ class Transaction(Base):
         nullable=False,
     )
     event_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    category_id: Mapped[UUID] = mapped_column(LedgerUUID, nullable=False)
+    category_id: Mapped[UUID | None] = mapped_column(LedgerUUID, nullable=True)
     merchant: Mapped[str | None] = mapped_column(String(255), nullable=True)
     memo: Mapped[str | None] = mapped_column(Text, nullable=True)
     photo_reference: Mapped[str | None] = mapped_column(String(1024), nullable=True)
@@ -286,7 +286,7 @@ class PostedAccountMovement(Base):
             "signed_amount <> 0", name="ck_posted_movements_amount_nonzero"
         ),
         CheckConstraint(
-            "transaction_type IN ('income', 'expense')",
+            "transaction_type IN ('income', 'expense', 'transfer')",
             name="ck_posted_movements_transaction_type",
         ),
         CheckConstraint(
@@ -350,7 +350,7 @@ class PostedAccountMovement(Base):
     signed_amount: Mapped[Decimal] = mapped_column(LedgerMoney, nullable=False)
     transaction_type: Mapped[str] = mapped_column(String(32), nullable=False)
     effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    category_id: Mapped[UUID] = mapped_column(LedgerUUID, nullable=False)
+    category_id: Mapped[UUID | None] = mapped_column(LedgerUUID, nullable=True)
     merchant: Mapped[str | None] = mapped_column(String(255), nullable=True)
     memo: Mapped[str | None] = mapped_column(Text, nullable=True)
     photo_reference: Mapped[str | None] = mapped_column(String(1024), nullable=True)
@@ -366,6 +366,36 @@ class PostedAccountMovement(Base):
     posted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )
+
+
+class Transfer(Base):
+    __tablename__ = "transfers"
+    id: Mapped[UUID] = mapped_column(LedgerUUID, primary_key=True)
+    plan_id: Mapped[UUID] = mapped_column(LedgerUUID, nullable=False)
+    source_account_id: Mapped[UUID] = mapped_column(LedgerUUID, nullable=False)
+    destination_account_id: Mapped[UUID] = mapped_column(LedgerUUID, nullable=False)
+    outbound_amount: Mapped[Decimal] = mapped_column(LedgerMoney, nullable=False)
+    outbound_currency_code: Mapped[str] = mapped_column(String(16), nullable=False)
+    inbound_amount: Mapped[Decimal] = mapped_column(LedgerMoney, nullable=False)
+    inbound_currency_code: Mapped[str] = mapped_column(String(16), nullable=False)
+    event_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    rate: Mapped[Decimal] = mapped_column(Numeric(76, 38), nullable=False)
+    rate_source: Mapped[str | None] = mapped_column(Text, nullable=True)
+    memo: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reversal_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provenance: Mapped[dict[str, Any]] = mapped_column(LedgerJSON, nullable=False)
+    creation_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    reverses_transfer_id: Mapped[UUID | None] = mapped_column(LedgerUUID, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class TransferLeg(Base):
+    __tablename__ = "transfer_legs"
+    id: Mapped[UUID] = mapped_column(LedgerUUID, primary_key=True)
+    plan_id: Mapped[UUID] = mapped_column(LedgerUUID, nullable=False)
+    transfer_id: Mapped[UUID] = mapped_column(LedgerUUID, nullable=False)
+    transaction_id: Mapped[UUID] = mapped_column(LedgerUUID, nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
 
 
 class TransactionTag(Base):

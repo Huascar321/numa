@@ -69,41 +69,50 @@ one `201` plus one `409`, never `500` or a partial assignment.
 - **THEN** both assignment records remain auditable and the Category's Assigned value is `75.00`.
 
 ### Requirement: Baseline monthly summary and Category envelopes
-For each requested Plan month, the server MUST calculate only these baseline
-values in the Plan budget currency from posted movements and immutable
-assignments:
-
-- `Ready to Assign = income for the month - assignments for the month`;
-- `Assigned(category) = assignments for the Category and month`;
-- `Activity(category) = posted expense movement activity for the Category and month`, signed negative; and
-- `Available(category) = Assigned(category) + Activity(category)`.
-
-Income contributes to Ready to Assign but not Category Activity. Only posted
-movements whose Account currency equals the Plan budget currency may contribute
-to these equations. The calculation MUST include compensating and replacement
-movements so Transaction corrections revise balances and activity audibly. It
-MUST NOT apply rollover, an overspending policy across months, Goals, Targets,
-or special Credit Card automation in this phase.
+Monthly summary and Category envelope equations MUST select only posted
+`income` and `expense` movements of the required classification. Transfer
+movements, including same-currency, cross-currency, and reversal legs, MUST
+contribute to none of Ready to Assign, Assigned, Activity, Available, total
+activity, or Category activity regardless of their effective month. No selector
+MAY implement "not income means expense"; it MUST explicitly match `expense`
+when calculating expense activity and explicitly match `income` when calculating
+income.
 
 #### Scenario: Calculate a baseline envelope
 - **GIVEN** budget-currency income of `100.00`, a `60.00` assignment to one Category, and a posted `20.00` expense in that Category during one Plan month
 - **WHEN** the monthly summary and Category envelope are requested
 - **THEN** Ready to Assign is `40.00`, Assigned is `60.00`, Activity is `-20.00`, and Available is `40.00`.
 
+#### Scenario: Exclude a same-currency transfer from envelopes
+- **GIVEN** a budget-currency Transfer between two Accounts during a Plan month
+- **WHEN** that month summary and every Category envelope are requested
+- **THEN** neither leg contributes to Ready to Assign, Activity, Available, or any Category total.
+
 ### Requirement: Explicit unconverted budget reporting
-A Transaction whose Account currency differs from the Plan budget currency MUST
-still affect its Account balance through its posted movement. It MUST NOT be
-silently converted or included in Ready to Assign, Assigned, Activity, or
-Available. The monthly summary MUST report excluded income and expense as
-`unconverted_by_currency`, and each Category envelope MUST report its excluded
-expense activity as `unconverted_by_currency`. Each entry MUST keep one
-currency, exact decimal-string values, and the contributing Transaction or
-movement identifiers; values from different currencies MUST NOT be aggregated.
+`unconverted_by_currency` MUST contain only applicable income or expense
+movements excluded because their Account currency differs from the Plan budget
+currency. Transfer and reversal movements MUST never appear in
+`unconverted_by_currency`, even when their currencies differ from the Plan
+budget currency. In particular, `_unconverted_summary` MUST classify an amount
+as expense only when `transaction_type = 'expense'`; it MUST not use an `else`
+branch for every non-income classifier. SQL MUST reject a movement classifier
+that does not equal its referenced Transaction type before a projection can
+observe it.
 
 #### Scenario: Exclude foreign-currency activity
 - **GIVEN** a BOB-budget Plan with a posted USDT expense in a Category
 - **WHEN** the month summary and that Category envelope are read
 - **THEN** the USDT movement changes only its USDT Account balance, is excluded from budget totals, and appears explicitly as unconverted USDT activity.
+
+#### Scenario: Exclude a cross-currency transfer from unconverted reporting
+- **GIVEN** a BOB-budget Plan posts a BOB-to-USDT Transfer
+- **WHEN** its monthly summary and Category envelopes are read
+- **THEN** the Transfer changes both Account balances but creates no BOB or USDT unconverted budget entry.
+
+#### Scenario: Explicit classifier selection excludes a foreign transfer
+- **GIVEN** a BOB-budget Plan contains a valid USDT expense and a BOB-to-USDT Transfer in the same month
+- **WHEN** `_unconverted_summary` and all monthly/category selectors run
+- **THEN** only the expense appears as unconverted expense activity, neither transfer leg appears, and a direct-SQL classifier mismatch is rejected before either selector can run.
 
 ### Requirement: Concrete Plan-scoped budget API and minimal UI
 The server MUST expose `PUT /plans/{plan_id}/budget-assignments/{assignment_id}`,

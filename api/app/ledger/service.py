@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
 from hashlib import sha256
 import json
+import unicodedata
 from typing import Any, Generic, Iterable, TypeVar
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -29,6 +30,8 @@ from app.ledger.models import (
     Transaction,
     TransactionCorrection,
     TransactionTag,
+    Transfer,
+    TransferLeg,
 )
 from app.ledger.schemas import (
     AssignmentCreate,
@@ -41,6 +44,8 @@ from app.ledger.schemas import (
     TagPatch,
     TransactionCorrectionCreate,
     TransactionCreate,
+    TransferCreate,
+    TransferReversalCreate,
 )
 
 
@@ -114,7 +119,11 @@ def quantize_at_scale(amount: Decimal, decimal_places: int, *, positive: bool) -
         raise LedgerValidationError("amount must be positive")
     quantum = Decimal(1).scaleb(-decimal_places)
     try:
-        quantized = amount.quantize(quantum)
+        # The NUMERIC(38,18) domain exceeds Python's default Decimal context.
+        # Quantization validates representability; it must never round input.
+        with localcontext() as context:
+            context.prec = 160
+            quantized = amount.quantize(quantum)
     except InvalidOperation as exc:
         raise LedgerValidationError("amount has an invalid scale") from exc
     if quantized != amount:
@@ -142,6 +151,59 @@ def require_aware_timestamp(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise LedgerValidationError("event_at must include a timezone offset")
     return value
+
+
+def canonical_transfer_text(value: str | None, *, field: str, required: bool, maximum: int) -> str | None:
+    """The API half of the UTF8 SQL canonical-transfer-text contract."""
+    if value is None:
+        if required:
+            raise LedgerValidationError(f"{field} is required")
+        return None
+    result = unicodedata.normalize("NFC", value).strip(" ")
+    if any(0 <= ord(char) <= 31 or ord(char) == 127 or 128 <= ord(char) <= 159 for char in result):
+        raise LedgerValidationError(f"{field} contains a forbidden control character")
+    if not result:
+        if required:
+            raise LedgerValidationError(f"{field} must not be empty")
+        return None
+    if len(result) > maximum:
+        raise LedgerValidationError(f"{field} is too long")
+    return result
+
+
+TRANSFER_MIN = Decimal("0.000000000000000001")
+TRANSFER_MAX = Decimal("99999999999999999999.999999999999999999")
+TRANSFER_RATE_QUANTUM = Decimal("1e-38")
+
+
+def transfer_amount(value: str, *, field: str) -> Decimal:
+    amount = parse_exact_decimal(value, field_name=field)
+    exponent = amount.as_tuple().exponent
+    if amount < TRANSFER_MIN or amount > TRANSFER_MAX or not isinstance(exponent, int) or exponent < -18:
+        raise LedgerValidationError(f"{field} is outside NUMERIC(38,18)")
+    with localcontext() as context:
+        context.prec = 160
+        return amount.quantize(Decimal("1e-18"))
+
+
+def transfer_amount_for_account(session: Session, value: str, account: Account, *, field: str) -> Decimal:
+    amount = transfer_amount(value, field=field)
+    try:
+        return quantize_at_scale(amount, require_currency(session, account.currency_code).decimal_places, positive=True)
+    except LedgerValidationError as exc:
+        raise LedgerValidationError(f"{field} has more decimal places than its Account currency") from exc
+
+
+def transfer_rate(outbound: Decimal, inbound: Decimal) -> Decimal:
+    try:
+        with localcontext() as context:
+            context.prec = 160
+            rate = (outbound / inbound).quantize(TRANSFER_RATE_QUANTUM, rounding=ROUND_HALF_EVEN)
+    except (InvalidOperation, ValueError) as exc:
+        raise LedgerValidationError("transfer rate is invalid") from exc
+    if not rate.is_finite() or rate <= 0 or rate > Decimal("99999999999999999999999999999999999999.99999999999999999999999999999999999999"):
+        raise LedgerValidationError("transfer rate is outside NUMERIC(76,38)")
+    return rate
 
 
 def _get_plan(session: Session, plan_id: UUID) -> Plan:
@@ -501,7 +563,7 @@ def transaction_snapshot(
         "amount": fixed_amount(Decimal(transaction.amount), currency),
         "currency_code": transaction.currency_code,
         "event_at": transaction.event_at.isoformat(),
-        "category_id": str(transaction.category_id),
+        "category_id": str(transaction.category_id) if transaction.category_id is not None else None,
         "merchant": transaction.merchant,
         "memo": transaction.memo,
         "photo_reference": transaction.photo_reference,
@@ -635,15 +697,183 @@ def create_transaction(
     return CreationResult(transaction, True)
 
 
-def list_transactions(session: Session, plan_id: UUID) -> list[Transaction]:
+def _transfer_accounts(session: Session, plan_id: UUID, source_id: UUID, destination_id: UUID) -> tuple[Account, Account]:
+    if source_id == destination_id:
+        raise LedgerValidationError("source and destination Accounts must differ")
+    source = session.scalar(select(Account).where(Account.plan_id == plan_id, Account.id == source_id))
+    destination = session.scalar(select(Account).where(Account.plan_id == plan_id, Account.id == destination_id))
+    if source is None or destination is None:
+        raise ResourceNotFound("Account not found")
+    if source.status != "active" or destination.status != "active":
+        raise ArchivedResource("archived Accounts reject new postings")
+    return source, destination
+
+
+def _transfer_fingerprint(*, plan_id: UUID, transfer_id: UUID, source: Account, destination: Account,
+                          outbound: Decimal, inbound: Decimal, event_at: datetime, memo: str | None,
+                          reason: str | None, rate_source: str | None, provenance: dict[str, Any],
+                          reverses: UUID | None) -> str:
+    return fingerprint({"plan_id": plan_id, "transfer_id": transfer_id, "source_account_id": source.id,
+        "destination_account_id": destination.id, "outbound_amount": outbound,
+        "outbound_currency_code": source.currency_code, "inbound_amount": inbound,
+        "inbound_currency_code": destination.currency_code, "event_at": event_at, "memo": memo,
+        "reversal_reason": reason, "rate_source": rate_source, "provenance": provenance,
+        "reverses_transfer_id": reverses, "legs": ["outbound", "inbound"]})
+
+
+def _post_transfer(session: Session, *, plan_id: UUID, transfer_id: UUID, source: Account,
+                   destination: Account, outbound: Decimal, inbound: Decimal, event_at: datetime,
+                   memo: str | None, reversal_reason: str | None, rate_source: str | None,
+                   provenance: dict[str, Any], reverses_transfer_id: UUID | None) -> CreationResult[Transfer]:
+    if source.currency_code == destination.currency_code:
+        with localcontext() as context:
+            context.prec = 160
+            rate = Decimal(1).quantize(TRANSFER_RATE_QUANTUM)
+    else:
+        rate = transfer_rate(outbound, inbound)
+    if source.currency_code == destination.currency_code:
+        if outbound != inbound:
+            raise LedgerValidationError("same-currency transfer amounts must match")
+        if rate_source is not None:
+            raise LedgerValidationError("same-currency transfer must not include rate_source")
+    elif rate_source is None:
+        raise LedgerValidationError("cross-currency transfer requires rate_source")
+    request_fingerprint = _transfer_fingerprint(plan_id=plan_id, transfer_id=transfer_id, source=source,
+        destination=destination, outbound=outbound, inbound=inbound, event_at=event_at, memo=memo,
+        reason=reversal_reason, rate_source=rate_source, provenance=provenance, reverses=reverses_transfer_id)
+    inserted = session.scalar(insert(Transfer).values(id=transfer_id, plan_id=plan_id,
+        source_account_id=source.id, destination_account_id=destination.id, outbound_amount=outbound,
+        outbound_currency_code=source.currency_code, inbound_amount=inbound,
+        inbound_currency_code=destination.currency_code, event_at=event_at, rate=rate,
+        rate_source=rate_source, memo=memo, reversal_reason=reversal_reason, provenance=provenance,
+        creation_fingerprint=request_fingerprint, reverses_transfer_id=reverses_transfer_id)
+        .on_conflict_do_nothing().returning(Transfer.id))
+    # Do not disclose that a client UUID belongs to another Plan.  This query
+    # also handles the post-ON-CONFLICT race after a same-Plan winner commits.
+    transfer = session.scalar(select(Transfer).where(Transfer.plan_id == plan_id, Transfer.id == transfer_id).execution_options(populate_existing=True))
+    if transfer is None:
+        raise ResourceNotFound("Transfer not found")
+    if transfer.creation_fingerprint != request_fingerprint:
+        raise CreationConflict("Transfer UUID has a different creation payload")
+    if inserted is None:
+        return CreationResult(transfer, False)
+    outbound_transaction, inbound_transaction = uuid4(), uuid4()
+    session.add_all([
+        Transaction(id=outbound_transaction, plan_id=plan_id, account_id=source.id, type="transfer", amount=outbound,
+            currency_code=source.currency_code, event_at=event_at, category_id=None, source="transfer",
+            source_metadata={}, provenance=provenance, creation_fingerprint=fingerprint({"transfer": transfer_id, "role": "outbound"})),
+        Transaction(id=inbound_transaction, plan_id=plan_id, account_id=destination.id, type="transfer", amount=inbound,
+            currency_code=destination.currency_code, event_at=event_at, category_id=None, source="transfer",
+            source_metadata={}, provenance=provenance, creation_fingerprint=fingerprint({"transfer": transfer_id, "role": "inbound"})),
+    ])
+    session.flush()
+    session.add_all([
+        TransferLeg(id=uuid4(), plan_id=plan_id, transfer_id=transfer_id, transaction_id=outbound_transaction, role="outbound"),
+        TransferLeg(id=uuid4(), plan_id=plan_id, transfer_id=transfer_id, transaction_id=inbound_transaction, role="inbound"),
+    ])
+    session.flush()
+    session.add_all([
+        PostedAccountMovement(id=uuid4(), plan_id=plan_id, account_id=source.id, transaction_id=outbound_transaction,
+            correction_id=None, correction_sequence=0, currency_code=source.currency_code, signed_amount=-outbound,
+            transaction_type="transfer", effective_at=event_at, category_id=None, source="transfer", source_metadata={},
+            provenance=provenance, movement_kind="original", posted_at=utc_now()),
+        PostedAccountMovement(id=uuid4(), plan_id=plan_id, account_id=destination.id, transaction_id=inbound_transaction,
+            correction_id=None, correction_sequence=0, currency_code=destination.currency_code, signed_amount=inbound,
+            transaction_type="transfer", effective_at=event_at, category_id=None, source="transfer", source_metadata={},
+            provenance=provenance, movement_kind="original", posted_at=utc_now()),
+    ])
+    session.flush()
+    return CreationResult(transfer, True)
+
+
+def create_transfer(session: Session, *, plan_id: UUID, transfer_id: UUID, payload: TransferCreate) -> CreationResult[Transfer]:
     _get_plan(session, plan_id)
-    return list(
+    durable = session.scalar(select(Transfer).where(Transfer.plan_id == plan_id, Transfer.id == transfer_id))
+    if durable is not None:
+        source = session.scalar(select(Account).where(Account.plan_id == plan_id, Account.id == durable.source_account_id))
+        destination = session.scalar(select(Account).where(Account.plan_id == plan_id, Account.id == durable.destination_account_id))
+        if source is None or destination is None:
+            raise ResourceNotFound("Transfer Account not found")
+        outbound = transfer_amount_for_account(session, payload.outbound_amount, source, field="outbound_amount")
+        inbound = transfer_amount_for_account(session, payload.inbound_amount, destination, field="inbound_amount")
+        memo = canonical_transfer_text(payload.memo, field="memo", required=False, maximum=2000)
+        if source.currency_code == destination.currency_code and "rate_source" in payload.model_fields_set:
+            raise LedgerValidationError("same-currency transfer must not include rate_source")
+        rate_source = canonical_transfer_text(payload.rate_source, field="rate_source", required=source.currency_code != destination.currency_code, maximum=128)
+        request_fingerprint = _transfer_fingerprint(plan_id=plan_id, transfer_id=transfer_id, source=source, destination=destination,
+            outbound=outbound, inbound=inbound, event_at=require_aware_timestamp(payload.event_at), memo=memo,
+            reason=None, rate_source=rate_source, provenance=payload.provenance, reverses=None)
+        if payload.source_account_id != source.id or payload.destination_account_id != destination.id or durable.creation_fingerprint != request_fingerprint:
+            raise CreationConflict("Transfer UUID has a different creation payload")
+        return CreationResult(durable, False)
+    source, destination = _transfer_accounts(session, plan_id, payload.source_account_id, payload.destination_account_id)
+    outbound = transfer_amount_for_account(session, payload.outbound_amount, source, field="outbound_amount")
+    inbound = transfer_amount_for_account(session, payload.inbound_amount, destination, field="inbound_amount")
+    event_at = require_aware_timestamp(payload.event_at)
+    memo = canonical_transfer_text(payload.memo, field="memo", required=False, maximum=2000)
+    if source.currency_code == destination.currency_code and "rate_source" in payload.model_fields_set:
+        raise LedgerValidationError("same-currency transfer must not include rate_source")
+    rate_source = canonical_transfer_text(payload.rate_source, field="rate_source", required=source.currency_code != destination.currency_code, maximum=128)
+    return _post_transfer(session, plan_id=plan_id, transfer_id=transfer_id, source=source, destination=destination,
+        outbound=outbound, inbound=inbound, event_at=event_at, memo=memo, reversal_reason=None,
+        rate_source=rate_source, provenance=payload.provenance, reverses_transfer_id=None)
+
+
+def get_transfer(session: Session, plan_id: UUID, transfer_id: UUID, *, for_update: bool = False) -> Transfer:
+    query = select(Transfer).where(Transfer.plan_id == plan_id, Transfer.id == transfer_id)
+    if for_update:
+        query = query.with_for_update(of=Transfer)
+    transfer = session.scalar(query)
+    if transfer is None:
+        raise ResourceNotFound("Transfer not found")
+    return transfer
+
+
+def list_transfers(session: Session, plan_id: UUID) -> list[Transfer]:
+    _get_plan(session, plan_id)
+    return list(session.scalars(select(Transfer).where(Transfer.plan_id == plan_id).order_by(Transfer.event_at.desc(), Transfer.id)))
+
+
+def reverse_transfer(session: Session, *, plan_id: UUID, transfer_id: UUID, reversal_id: UUID,
+                     payload: TransferReversalCreate) -> CreationResult[Transfer]:
+    parent = get_transfer(session, plan_id, transfer_id, for_update=True)
+    existing = session.scalar(select(Transfer).where(Transfer.plan_id == plan_id, Transfer.reverses_transfer_id == parent.id))
+    if existing is not None and existing.id != reversal_id:
+        raise CreationConflict("Transfer already has a reversal")
+    if existing is not None:
+        source = session.scalar(select(Account).where(Account.plan_id == plan_id, Account.id == parent.destination_account_id))
+        destination = session.scalar(select(Account).where(Account.plan_id == plan_id, Account.id == parent.source_account_id))
+        if source is None or destination is None:
+            raise ResourceNotFound("Transfer Account not found")
+        memo = canonical_transfer_text(payload.memo, field="memo", required=False, maximum=2000)
+        reason = canonical_transfer_text(payload.reversal_reason, field="reversal_reason", required=True, maximum=500)
+        request_fingerprint = _transfer_fingerprint(plan_id=plan_id, transfer_id=reversal_id, source=source, destination=destination,
+            outbound=Decimal(parent.inbound_amount), inbound=Decimal(parent.outbound_amount), event_at=require_aware_timestamp(payload.event_at),
+            memo=memo, reason=reason, rate_source="reversal" if source.currency_code != destination.currency_code else None,
+            provenance=payload.provenance, reverses=parent.id)
+        if existing.creation_fingerprint != request_fingerprint:
+            raise CreationConflict("Transfer UUID has a different creation payload")
+        return CreationResult(existing, False)
+    source, destination = _transfer_accounts(session, plan_id, parent.destination_account_id, parent.source_account_id)
+    memo = canonical_transfer_text(payload.memo, field="memo", required=False, maximum=2000)
+    reason = canonical_transfer_text(payload.reversal_reason, field="reversal_reason", required=True, maximum=500)
+    return _post_transfer(session, plan_id=plan_id, transfer_id=reversal_id, source=source, destination=destination,
+        outbound=Decimal(parent.inbound_amount), inbound=Decimal(parent.outbound_amount), event_at=require_aware_timestamp(payload.event_at),
+        memo=memo, reversal_reason=reason, rate_source="reversal" if source.currency_code != destination.currency_code else None,
+        provenance=payload.provenance, reverses_transfer_id=parent.id)
+
+
+def list_transactions(session: Session, plan_id: UUID) -> list[Transaction | Transfer]:
+    _get_plan(session, plan_id)
+    ordinary = list(
         session.scalars(
             select(Transaction)
-            .where(Transaction.plan_id == plan_id)
+            .where(Transaction.plan_id == plan_id, Transaction.type != "transfer")
             .order_by(Transaction.event_at.desc(), Transaction.id)
         )
     )
+    roots = list(session.scalars(select(Transfer).where(Transfer.plan_id == plan_id)))
+    return sorted([*ordinary, *roots], key=lambda item: (item.event_at, item.id), reverse=True)
 
 
 def get_transaction(session: Session, plan_id: UUID, transaction_id: UUID) -> Transaction:
@@ -804,6 +1034,8 @@ def correct_transaction(
     # This lock is the correction serialization boundary. It deliberately
     # precedes every snapshot, Tag-state, and effective-movement read.
     transaction = _get_transaction_for_update(session, plan_id, transaction_id)
+    if transaction.type == "transfer":
+        raise CreationConflict("transfer Transactions may only be reversed as a paired Transfer")
     existing_correction = session.scalar(
         select(TransactionCorrection).where(TransactionCorrection.id == correction_id)
     )
@@ -1200,6 +1432,8 @@ def _unconverted_summary(
 ) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for movement in movements:
+        if movement.transaction_type not in {"income", "expense"}:
+            continue
         if movement.currency_code == plan.reporting_currency_code:
             continue
         if category_id is not None and movement.category_id != category_id:
@@ -1221,7 +1455,7 @@ def _unconverted_summary(
         entry["amount"] += signed
         if movement.transaction_type == "income":
             entry["income"] += signed
-        else:
+        elif movement.transaction_type == "expense":
             entry["expense"] += signed
         entry["movement_ids"].append(movement.id)
         if movement.transaction_id not in entry["transaction_ids"]:

@@ -168,6 +168,16 @@ function createLedgerServer() {
     balance: { amount: "0.00", currency: "BOB" },
     created_at: timestamp,
     updated_at: timestamp,
+  }, {
+    id: "account-usdt",
+    plan_id: planId,
+    name: "USDT wallet",
+    account_type: "Crypto",
+    currency_code: "USDT",
+    status: "active",
+    balance: { amount: "0.000000", currency: "USDT" },
+    created_at: timestamp,
+    updated_at: timestamp,
   }];
   const categories: Category[] = [
     {
@@ -210,6 +220,7 @@ function createLedgerServer() {
   const transactions: Array<Record<string, unknown>> = [];
   const corrections = new Map<string, Array<Record<string, unknown>>>();
   const assignments: Array<Record<string, unknown>> = [];
+  const transfers: Array<Record<string, unknown>> = [];
   const fetchMock = vi.fn(async (
     input: RequestInfo | URL,
     init?: RequestInit,
@@ -284,6 +295,32 @@ function createLedgerServer() {
 
     if (path === `/plans/${planId}/transactions` && method === "GET") {
       return jsonResponse(transactions);
+    }
+    if (path === `/plans/${planId}/transfers` && method === "GET") return jsonResponse(transfers);
+    const transferPut = path.match(new RegExp(`^/plans/${planId}/transfers/([^/]+)$`));
+    if (transferPut && method === "PUT") {
+      const transfer = {
+        id: transferPut[1], plan_id: planId, source_account_id: body.source_account_id,
+        destination_account_id: body.destination_account_id, outbound_amount: body.outbound_amount,
+        outbound_currency_code: "BOB", inbound_amount: body.inbound_amount,
+        inbound_currency_code: "USDT", event_at: body.event_at, rate: "10.00000000000000000000000000000000000000",
+        rate_source: body.rate_source, memo: body.memo ?? null, reversal_reason: null,
+        provenance: body.provenance ?? {}, reverses_transfer_id: null, created_at: timestamp,
+        legs: [{ id: "leg-out", role: "outbound", transaction_id: "transaction-out", movement_id: "movement-out" }, { id: "leg-in", role: "inbound", transaction_id: "transaction-in", movement_id: "movement-in" }],
+      };
+      transfers.push(transfer);
+      transactions.push(transfer);
+      return jsonResponse(transfer, 201);
+    }
+    const reversalPut = path.match(new RegExp(`^/plans/${planId}/transfers/([^/]+)/reversals/([^/]+)$`));
+    if (reversalPut && method === "PUT") {
+      const parent = transfers.find((transfer) => transfer.id === reversalPut[1]);
+      if (!parent) return jsonResponse({}, 404);
+      const reversal = { ...parent, id: reversalPut[2], event_at: body.event_at, memo: body.memo ?? null,
+        reversal_reason: body.reversal_reason, reverses_transfer_id: parent.id, rate_source: "reversal" };
+      transfers.push(reversal);
+      transactions.push(reversal);
+      return jsonResponse(reversal, 201);
     }
     const transactionPut = path.match(new RegExp(`^/plans/${planId}/transactions/([^/]+)$`));
     if (transactionPut && method === "PUT") {
@@ -486,7 +523,7 @@ describe("minimal authoritative client flows", () => {
     renderApp("/plans/plan-ledger/ledger");
 
     expect(await screen.findByRole("heading", { name: "Ledger" })).toBeInTheDocument();
-    expect(await screen.findByRole("option", { name: /Main account/ })).toBeInTheDocument();
+    expect((await screen.findAllByRole("option", { name: /Main account/ })).length).toBeGreaterThan(0);
     fireEvent.change(screen.getByLabelText("Amount (exact decimal string)"), {
       target: { value: "12.00" },
     });
@@ -512,5 +549,27 @@ describe("minimal authoritative client flows", () => {
     expect(await screen.findByText(/Assigned 20\.00/)).toBeInTheDocument();
     expect(screen.getAllByText(/Unconverted USDT: -1\.000000/).length).toBeGreaterThan(0);
     expect(server.fetchMock.mock.calls.some(([path]) => String(path).includes("/budget/months/"))).toBe(true);
+  });
+
+  it("posts an exact cross-currency Transfer, renders grouped facts, and refetches after reversal", async () => {
+    const server = createLedgerServer();
+    renderApp("/plans/plan-ledger/ledger");
+
+    await screen.findByLabelText("Sent (exact)");
+    fireEvent.change(screen.getByLabelText("Sent (exact)"), { target: { value: "99999999999999999999.99" } });
+    fireEvent.change(screen.getByLabelText("Received (exact)"), { target: { value: "10.000000" } });
+    fireEvent.change(screen.getByLabelText("Rate source evidence"), { target: { value: "bank receipt" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Transfer" }));
+
+    expect(await screen.findByText(/Transfer 99999999999999999999\.99 BOB/)).toBeInTheDocument();
+    expect(screen.getByText(/Event 2026-/)).toBeInTheDocument();
+    expect(screen.getByText(/outbound leg leg-out, transaction transaction-out/)).toBeInTheDocument();
+    const transferCard = screen.getByText(/Transfer 99999999999999999999\.99 BOB/).closest("article") as HTMLElement;
+    expect(within(transferCard).queryByRole("button", { name: /correct|delete|unlink|edit/i })).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Reversal reason"), { target: { value: "duplicate" } });
+    fireEvent.click(screen.getByRole("button", { name: "Reverse transfer" }));
+    expect(await screen.findByText("Reversal reason: duplicate")).toBeInTheDocument();
+    await waitFor(() => expect(server.fetchMock.mock.calls.filter(([path]) => String(path).includes("/transfers")).length).toBeGreaterThan(2));
   });
 });
