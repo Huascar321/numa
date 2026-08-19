@@ -105,6 +105,9 @@ class Category(Base):
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, server_default=text("'active'")
     )
+    goal_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    goal_target: Mapped[Decimal | None] = mapped_column(LedgerMoney, nullable=True)
+    goal_due_month: Mapped[str | None] = mapped_column(String(7), nullable=True)
     creation_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")

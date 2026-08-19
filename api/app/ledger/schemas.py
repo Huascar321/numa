@@ -56,17 +56,51 @@ class CategoryGroupResponse(BaseModel):
 class CategoryCreate(StrictRequest):
     name: NonEmptyName
     group_id: UUID | None = None
+    goal_type: Literal["target_balance", "monthly_funding", "due_date"] | None = None
+    goal_target: StrictStr | None = None
+    goal_due_month: str | None = None
+
+    @model_validator(mode="after")
+    def validate_goal(self) -> "CategoryCreate":
+        _validate_goal_fields(self.goal_type, self.goal_target, self.goal_due_month)
+        return self
 
 
 class CategoryPatch(StrictRequest):
     name: NonEmptyName | None = None
     group_id: UUID | None = None
+    goal_type: Literal["target_balance", "monthly_funding", "due_date"] | None = None
+    goal_target: StrictStr | None = None
+    goal_due_month: str | None = None
 
     @model_validator(mode="after")
     def require_a_change(self) -> "CategoryPatch":
         if not self.model_fields_set:
-            raise ValueError("category patch must change name or group_id")
+            raise ValueError("category patch must change name, group_id, or goal")
+        goal_fields = {"goal_type", "goal_target", "goal_due_month"}
+        if self.model_fields_set & goal_fields:
+            _validate_goal_fields(self.goal_type, self.goal_target, self.goal_due_month)
         return self
+
+
+def _validate_goal_fields(goal_type: str | None, goal_target: str | None, goal_due_month: str | None) -> None:
+    if goal_type is None:
+        if goal_target is not None or goal_due_month is not None:
+            raise ValueError("goal_target and goal_due_month require goal_type")
+        return
+    if goal_target is None:
+        raise ValueError("goal_target is required")
+    if goal_type == "due_date":
+        if goal_due_month is None or len(goal_due_month) != 7 or goal_due_month[4] != "-":
+            raise ValueError("due-date goals require goal_due_month in YYYY-MM")
+        try:
+            year, month = int(goal_due_month[:4]), int(goal_due_month[5:])
+        except ValueError as exc:
+            raise ValueError("due-date goals require goal_due_month in YYYY-MM") from exc
+        if year < 1 or month not in range(1, 13):
+            raise ValueError("due-date goals require goal_due_month in YYYY-MM")
+    elif goal_due_month is not None:
+        raise ValueError("goal_due_month is only valid for due-date goals")
 
 
 class CategoryResponse(BaseModel):
@@ -78,6 +112,9 @@ class CategoryResponse(BaseModel):
     name: str
     is_pending: bool
     status: Literal["active", "archived"]
+    goal_type: Literal["target_balance", "monthly_funding", "due_date"] | None
+    goal_target: StrictStr | None
+    goal_due_month: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -309,7 +346,19 @@ class CategoryEnvelopeResponse(BaseModel):
     assigned_money: MoneyResponse
     activity_money: MoneyResponse
     available_money: MoneyResponse
+    rollover: StrictStr
+    cash_overspending: StrictStr
+    credit_card_overspending: StrictStr
+    goal: "GoalResponse | None" = None
     unconverted_by_currency: list[UnconvertedCurrencyResponse]
+
+
+class GoalResponse(BaseModel):
+    type: Literal["target_balance", "monthly_funding", "due_date"]
+    target: StrictStr
+    due_month: str | None = None
+    required_contribution: StrictStr
+    status: Literal["completed", "funded", "on_track", "underfunded"]
 
 
 class MonthlySummaryResponse(BaseModel):

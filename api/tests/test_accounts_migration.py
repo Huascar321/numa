@@ -78,7 +78,7 @@ def test_clean_postgresql_18_database_reaches_accounts_head(
 
         config = _alembic_config(database_url)
         scripts = ScriptDirectory.from_config(config)
-        assert scripts.get_revision(EXPECTED_REVISION).down_revision == "003_ledger_core"
+        assert scripts.get_revision(EXPECTED_REVISION).down_revision == "004_transfers"
 
         command.upgrade(config, "head")
 

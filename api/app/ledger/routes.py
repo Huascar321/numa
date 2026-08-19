@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from app.accounts.models import Account
 from app.accounts.schemas import BalanceResponse
-from app.accounts.service import account_balance, get_account
+from app.accounts.service import account_balance, get_account, get_plan
 from app.db import session_scope
 from app.ledger.models import Category, CategoryGroup, MonthlyBudgetAssignment, Tag, Transaction, TransactionCorrection, Transfer, TransferLeg, PostedAccountMovement
 from app.ledger.schemas import (
@@ -98,8 +98,18 @@ def _category_group_response(group: CategoryGroup) -> CategoryGroupResponse:
     return CategoryGroupResponse.model_validate(group)
 
 
-def _category_response(category: Category) -> CategoryResponse:
-    return CategoryResponse.model_validate(category)
+def _category_response(session: Session, category: Category) -> CategoryResponse:
+    currency = require_currency(session, get_plan(session, category.plan_id).reporting_currency_code)
+    return CategoryResponse.model_validate(
+        {
+            "id": category.id, "plan_id": category.plan_id, "group_id": category.group_id,
+            "name": category.name, "is_pending": category.is_pending, "status": category.status,
+            "goal_type": category.goal_type,
+            "goal_target": fixed_amount(Decimal(category.goal_target), currency) if category.goal_target is not None else None,
+            "goal_due_month": category.goal_due_month, "created_at": category.created_at,
+            "updated_at": category.updated_at,
+        }
+    )
 
 
 def _tag_response(tag: Tag) -> TagResponse:
@@ -344,7 +354,7 @@ def put_category(
         raise _conflict(exc) from exc
     if not result.created:
         response.status_code = status.HTTP_200_OK
-    return _category_response(result.resource)
+    return _category_response(session, result.resource)
 
 
 @router.get("/plans/{plan_id}/categories", response_model=list[CategoryResponse])
@@ -352,7 +362,7 @@ def get_categories(
     plan_id: UUID, session: Session = Depends(get_database_session)
 ) -> list[CategoryResponse]:
     try:
-        return [_category_response(item) for item in list_categories(session, plan_id)]
+        return [_category_response(session, item) for item in list_categories(session, plan_id)]
     except ResourceNotFound as exc:
         raise _not_found(exc) from exc
 
@@ -367,7 +377,7 @@ def get_category(
         items = [item for item in list_categories(session, plan_id) if item.id == category_id]
         if not items:
             raise ResourceNotFound("Category not found")
-        return _category_response(items[0])
+        return _category_response(session, items[0])
     except ResourceNotFound as exc:
         raise _not_found(exc) from exc
 
@@ -386,7 +396,7 @@ def patch_category_route(
             category = patch_category(
                 session, plan_id=plan_id, category_id=category_id, payload=payload
             )
-        return _category_response(category)
+        return _category_response(session, category)
     except ResourceNotFound as exc:
         raise _not_found(exc) from exc
     except LedgerValidationError as exc:
@@ -403,7 +413,7 @@ def post_archive_category(
     try:
         with session.begin():
             category = archive_category(session, plan_id=plan_id, category_id=category_id)
-        return _category_response(category)
+        return _category_response(session, category)
     except ResourceNotFound as exc:
         raise _not_found(exc) from exc
     except LedgerValidationError as exc:

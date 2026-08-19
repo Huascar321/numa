@@ -936,3 +936,132 @@ def test_no_forbidden_ledger_capabilities(client: TestClient) -> None:
     assert "/plans/{plan_id}/transfers/{transfer_id}/reversals/{reversal_id}" in paths
     forbidden = ("cleared", "reconciliation", "rollover", "goal", "target", "fx")
     assert not any(any(word in path.lower() for word in forbidden) for path in paths)
+
+
+def test_budget_rollover_overspending_card_and_goals(client: TestClient) -> None:
+    plan_id = _plan(client)
+    bank = _account(client, plan_id, account_type="Bank")
+    card = _account(client, plan_id, account_type="Credit Card")
+    cash_category = _category(client, plan_id, "Cash overspend")
+    card_category = _category(client, plan_id, "Card overspend")
+    rollover_category = _category(client, plan_id, "Rollover")
+    target_category = str(uuid4())
+    monthly_category = str(uuid4())
+    due_category = str(uuid4())
+    target_response = client.put(
+        f"/plans/{plan_id}/categories/{target_category}",
+        json={"name": "Target", "goal_type": "target_balance", "goal_target": "50.00"},
+    )
+    assert target_response.status_code == 201
+    assert target_response.json()["goal_target"] == "50.00"
+    monthly_response = client.put(
+        f"/plans/{plan_id}/categories/{monthly_category}",
+        json={"name": "Monthly", "goal_type": "monthly_funding", "goal_target": "25.00"},
+    )
+    assert monthly_response.status_code == 201
+    assert monthly_response.json()["goal_target"] == "25.00"
+    due_response = client.put(
+        f"/plans/{plan_id}/categories/{due_category}",
+        json={"name": "Due", "goal_type": "due_date", "goal_target": "100.00", "goal_due_month": "2026-03"},
+    )
+    assert due_response.status_code == 201
+    assert due_response.json()["goal_target"] == "100.00"
+    for category_id, amount in (
+        (cash_category, "100.00"), (card_category, "100.00"), (rollover_category, "40.00"),
+        (target_category, "50.00"), (monthly_category, "25.00"), (due_category, "50.00"),
+    ):
+        assert client.put(
+            f"/plans/{plan_id}/budget-assignments/{uuid4()}",
+            json={"category_id": category_id, "month": "2026-02", "amount": amount},
+        ).status_code == 201
+    _transaction(client, plan_id, bank, amount="150.00", category_id=cash_category,
+                 event_at="2026-02-10T12:00:00Z")
+    _transaction(client, plan_id, card, amount="150.00", category_id=card_category,
+                 event_at="2026-02-10T12:00:00Z")
+
+    february = client.get(f"/plans/{plan_id}/budget/months/2026-02").json()
+    march = client.get(f"/plans/{plan_id}/budget/months/2026-03").json()
+    february_categories = {item["category_id"]: item for item in february["categories"]}
+    march_categories = {item["category_id"]: item for item in march["categories"]}
+    assert february_categories[cash_category]["available"] == "0.00"
+    assert february_categories[cash_category]["cash_overspending"] == "50.00"
+    assert february_categories[card_category]["credit_card_overspending"] == "50.00"
+    assert march["ready_to_assign"] == "-50.00"
+    assert march_categories[rollover_category]["rollover"] == "40.00"
+    assert client.get(f"/plans/{plan_id}/accounts/{card}/balance").json()["amount"] == "-150.00"
+    assert february_categories[target_category]["goal"]["status"] == "completed"
+    assert february_categories[target_category]["goal"]["required_contribution"] == "0.00"
+    assert february_categories[monthly_category]["goal"]["status"] == "funded"
+    assert february_categories[monthly_category]["goal"]["required_contribution"] == "25.00"
+    assert february_categories[due_category]["goal"] == {
+        "type": "due_date", "target": "100.00", "due_month": "2026-03",
+        "required_contribution": "25.00", "status": "on_track",
+    }
+
+
+def test_category_correction_compensation_does_not_leave_overspending(
+    client: TestClient,
+) -> None:
+    plan_id = _plan(client)
+    account_id = _account(client, plan_id)
+    original_category = _category(client, plan_id, "Original")
+    replacement_category = _category(client, plan_id, "Replacement")
+    assert client.put(
+        f"/plans/{plan_id}/budget-assignments/{uuid4()}",
+        json={"category_id": original_category, "month": "2026-01", "amount": "100.00"},
+    ).status_code == 201
+    transaction_id, _ = _transaction(
+        client, plan_id, account_id, amount="200.00", category_id=original_category,
+    )
+    assert client.put(
+        f"/plans/{plan_id}/transactions/{transaction_id}/corrections/{uuid4()}",
+        json={"category_id": replacement_category},
+    ).status_code == 201
+
+    original = client.get(
+        f"/plans/{plan_id}/budget/months/2026-01/categories/{original_category}"
+    ).json()
+    replacement = client.get(
+        f"/plans/{plan_id}/budget/months/2026-01/categories/{replacement_category}"
+    ).json()
+    assert original["activity"] == "0.00"
+    assert original["available"] == "100.00"
+    assert original["cash_overspending"] == "0.00"
+    assert replacement["activity"] == "-200.00"
+    assert replacement["cash_overspending"] == "200.00"
+
+
+def test_goal_category_replay_normalizes_minor_units(client: TestClient) -> None:
+    plan_id = _plan(client)
+    category_id = str(uuid4())
+    path = f"/plans/{plan_id}/categories/{category_id}"
+    first = client.put(path, json={
+        "name": "Savings", "goal_type": "target_balance", "goal_target": "50.0",
+    })
+    replay = client.put(path, json={
+        "name": "Savings", "goal_type": "target_balance", "goal_target": "50.00",
+    })
+    assert [first.status_code, replay.status_code] == [201, 200]
+    assert replay.json()["goal_target"] == "50.00"
+
+
+def test_due_date_goal_uses_displayed_minor_unit_contribution(client: TestClient) -> None:
+    plan_id = _plan(client)
+    category_id = str(uuid4())
+    assert client.put(
+        f"/plans/{plan_id}/categories/{category_id}",
+        json={"name": "Due", "goal_type": "due_date", "goal_target": "100.00", "goal_due_month": "2026-03"},
+    ).status_code == 201
+    assert client.put(
+        f"/plans/{plan_id}/budget-assignments/{uuid4()}",
+        json={"category_id": category_id, "month": "2025-12", "amount": "11.11"},
+    ).status_code == 201
+    assert client.put(
+        f"/plans/{plan_id}/budget-assignments/{uuid4()}",
+        json={"category_id": category_id, "month": "2026-01", "amount": "22.22"},
+    ).status_code == 201
+    goal = client.get(
+        f"/plans/{plan_id}/budget/months/2026-01/categories/{category_id}"
+    ).json()["goal"]
+    assert goal["required_contribution"] == "22.22"
+    assert goal["status"] == "on_track"

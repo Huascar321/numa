@@ -1,0 +1,26 @@
+name: numa-test-postgres-18
+
+services:
+  postgres:
+    container_name: numa-test-postgres-18
+    image: postgres:18
+    restart: unless-stopped
+    env_file:
+      - ./.env.numa-test
+    environment:
+      POSTGRES_DB: numa_test
+      POSTGRES_USER: numa_test
+      POSTGRES_INITDB_ARGS: --auth-local=scram-sha-256 --auth-host=scram-sha-256
+    ports:
+      - "127.0.0.1:29746:5432"
+    volumes:
+      - numa-test-postgres-18-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  numa-test-postgres-18-data:
+    name: numa-test-postgres-18-data
