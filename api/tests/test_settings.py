@@ -1,6 +1,8 @@
 from datetime import timedelta
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy.orm import sessionmaker
 
 from app.main import create_app
@@ -50,3 +52,18 @@ def test_worker_construction_does_not_require_optional_providers() -> None:
     assert first_worker.claimant_id.startswith("configuration-test-")
     assert second_worker.claimant_id.startswith("configuration-test-")
     assert first_worker.claimant_id != second_worker.claimant_id
+
+
+def test_reconciliation_configuration_has_safe_exact_defaults_and_validation() -> None:
+    settings = Settings()
+    assert settings.reconciliation_policy == "block"
+    assert settings.reconciliation_tolerance_atoms == 0
+
+    assert Settings(
+        reconciliation_policy="warn",
+        reconciliation_tolerance_atoms=25,
+    ).reconciliation_tolerance_atoms == 25
+    with pytest.raises(ValidationError):
+        Settings.model_validate({"reconciliation_policy": "allow"})
+    with pytest.raises(ValidationError):
+        Settings(reconciliation_tolerance_atoms=-1)

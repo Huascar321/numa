@@ -1,5 +1,6 @@
 import { ReactNode } from "react";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -143,7 +144,7 @@ function createServer() {
   };
 }
 
-function createLedgerServer() {
+function createLedgerServer(options: { deferReconciliationPreviews?: boolean } = {}) {
   const planId = "plan-ledger";
   const accountId = "account-ledger";
   const pendingId = "category-pending";
@@ -221,6 +222,11 @@ function createLedgerServer() {
   const corrections = new Map<string, Array<Record<string, unknown>>>();
   const assignments: Array<Record<string, unknown>> = [];
   const transfers: Array<Record<string, unknown>> = [];
+  const reconciliations: Array<Record<string, unknown>> = [];
+  const pendingReconciliationPreviews: Array<{
+    accountId: string;
+    release: () => void;
+  }> = [];
   const fetchMock = vi.fn(async (
     input: RequestInfo | URL,
     init?: RequestInit,
@@ -242,6 +248,58 @@ function createLedgerServer() {
     if (path === `/plans/${planId}/categories` && method === "GET") return jsonResponse(categories);
     if (path === `/plans/${planId}/category-groups` && method === "GET") return jsonResponse(groups);
     if (path === `/plans/${planId}/tags` && method === "GET") return jsonResponse(tags);
+
+    const reconciliationHistory = path.match(new RegExp(`^/plans/${planId}/accounts/([^/]+)/reconciliations$`));
+    if (reconciliationHistory && method === "GET") {
+      return jsonResponse(reconciliations.filter((item) => item.account_id === reconciliationHistory[1]));
+    }
+    const reconciliationPreview = path.match(new RegExp(`^/plans/${planId}/accounts/([^/]+)/reconciliations/([^/]+)/preview$`));
+    if (reconciliationPreview && method === "POST") {
+      const reconciliationAccount = accounts.find((item) => item.id === reconciliationPreview[1]);
+      if (!reconciliationAccount) return jsonResponse({}, 404);
+      const statement = String(body.statement_balance);
+      const discrepancy = statement === reconciliationAccount.balance.amount ? "0.00" : statement;
+      const response = jsonResponse({
+        id: reconciliationPreview[2], plan_id: planId, account_id: reconciliationAccount.id,
+        statement_balance: { amount: statement, currency: reconciliationAccount.currency_code },
+        statement_at: body.statement_at,
+        derived_balance: reconciliationAccount.balance,
+        discrepancy: { amount: discrepancy, currency: reconciliationAccount.currency_code },
+        policy: "warn", tolerance: { amount: "0.00", currency: reconciliationAccount.currency_code },
+        requires_warning_acceptance: discrepancy !== "0.00", blocked: false,
+      });
+      if (options.deferReconciliationPreviews) {
+        return new Promise<Response>((resolve) => {
+          pendingReconciliationPreviews.push({
+            accountId: reconciliationAccount.id,
+            release: () => resolve(response),
+          });
+        });
+      }
+      return response;
+    }
+    const reconciliationConfirm = path.match(new RegExp(`^/plans/${planId}/accounts/([^/]+)/reconciliations/([^/]+)$`));
+    if (reconciliationConfirm && method === "PUT") {
+      const reconciliationAccount = accounts.find((item) => item.id === reconciliationConfirm[1]);
+      if (!reconciliationAccount) return jsonResponse({}, 404);
+      const statement = String(body.statement_balance);
+      const discrepancy = statement === reconciliationAccount.balance.amount ? "0.00" : statement;
+      if (discrepancy !== "0.00" && body.warning_accepted !== true) return jsonResponse({ detail: "warning acceptance is required" }, 409);
+      const item = {
+        id: reconciliationConfirm[2], plan_id: planId, account_id: reconciliationAccount.id,
+        statement_balance: { amount: statement, currency: reconciliationAccount.currency_code },
+        statement_at: body.statement_at, derived_balance: { ...reconciliationAccount.balance },
+        discrepancy: { amount: discrepancy, currency: reconciliationAccount.currency_code },
+        policy: "warn", tolerance: { amount: "0.00", currency: reconciliationAccount.currency_code },
+        requires_warning_acceptance: discrepancy !== "0.00", blocked: false,
+        warning_accepted: body.warning_accepted, confirmed_at: timestamp,
+        adjustment_transaction_id: discrepancy === "0.00" ? null : `adjustment-${reconciliationConfirm[2]}`,
+        adjustment_movement_id: discrepancy === "0.00" ? null : `movement-${reconciliationConfirm[2]}`,
+      };
+      if (discrepancy !== "0.00") reconciliationAccount.balance = { amount: statement, currency: reconciliationAccount.currency_code };
+      reconciliations.unshift(item);
+      return jsonResponse(item, 201);
+    }
 
     const groupPut = path.match(new RegExp(`^/plans/${planId}/category-groups/([^/]+)$`));
     if (groupPut && method === "PUT") {
@@ -382,7 +440,7 @@ function createLedgerServer() {
     return jsonResponse({}, 404);
   });
   vi.stubGlobal("fetch", fetchMock);
-  return { planId, accountId, fetchMock };
+  return { planId, accountId, fetchMock, pendingReconciliationPreviews };
 }
 
 function renderApp(initialEntry: string) {
@@ -571,5 +629,91 @@ describe("minimal authoritative client flows", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reverse transfer" }));
     expect(await screen.findByText("Reversal reason: duplicate")).toBeInTheDocument();
     await waitFor(() => expect(server.fetchMock.mock.calls.filter(([path]) => String(path).includes("/transfers")).length).toBeGreaterThan(2));
+  });
+
+  it("previews, explicitly accepts a warning, confirms, and refetches immutable reconciliation history", async () => {
+    const server = createLedgerServer();
+    renderApp("/plans/plan-ledger/ledger");
+
+    const balance = await screen.findByLabelText("Statement balance (exact)");
+    await waitFor(() => expect(screen.getByLabelText("Reconciliation Account")).toHaveValue("account-ledger"));
+    fireEvent.change(balance, { target: { value: "5.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview reconciliation" }));
+    expect(await screen.findByText("Discrepancy 5.00 BOB")).toBeInTheDocument();
+    const confirm = screen.getByRole("button", { name: "Confirm reconciliation" });
+    expect(confirm).toBeDisabled();
+    fireEvent.click(screen.getByLabelText("I explicitly accept this discrepancy warning."));
+    fireEvent.click(confirm);
+
+    expect(await screen.findByText(/Adjustment adjustment-/)).toBeInTheDocument();
+    await waitFor(() => expect(server.fetchMock.mock.calls.filter(([path]) => String(path).includes("/accounts")).length).toBeGreaterThan(2));
+
+    fireEvent.click(screen.getByRole("button", { name: "Preview reconciliation" }));
+    expect(await screen.findByText("Discrepancy 0.00 BOB")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm reconciliation" }));
+    expect(await screen.findByText("Confirmed without adjustment")).toBeInTheDocument();
+  });
+
+  it("ignores an obsolete Account A preview that resolves after Account B", async () => {
+    const server = createLedgerServer({ deferReconciliationPreviews: true });
+    renderApp("/plans/plan-ledger/ledger");
+
+    const balance = await screen.findByLabelText("Statement balance (exact)");
+    await waitFor(() => expect(screen.getByLabelText("Reconciliation Account")).toHaveValue("account-ledger"));
+    fireEvent.change(balance, { target: { value: "5.00" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview reconciliation" }));
+    await waitFor(() => expect(server.pendingReconciliationPreviews).toHaveLength(1));
+
+    fireEvent.change(screen.getByLabelText("Reconciliation Account"), { target: { value: "account-usdt" } });
+    fireEvent.change(balance, { target: { value: "7.000000" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview reconciliation" }));
+    await waitFor(() => expect(server.pendingReconciliationPreviews).toHaveLength(2));
+
+    expect(server.pendingReconciliationPreviews.map((item) => item.accountId)).toEqual([
+      "account-ledger",
+      "account-usdt",
+    ]);
+    await act(async () => { server.pendingReconciliationPreviews[1].release(); });
+    expect(await screen.findByText("Discrepancy 7.000000 USDT")).toBeInTheDocument();
+
+    await act(async () => {
+      server.pendingReconciliationPreviews[0].release();
+      await Promise.resolve();
+    });
+    expect(screen.getByText("Discrepancy 7.000000 USDT")).toBeInTheDocument();
+    expect(screen.queryByText("Discrepancy 5.00 BOB")).not.toBeInTheDocument();
+  });
+
+  it("confirms exactly the immutable request snapshot represented by the preview", async () => {
+    const server = createLedgerServer();
+    renderApp("/plans/plan-ledger/ledger");
+
+    const balance = await screen.findByLabelText("Statement balance (exact)");
+    await waitFor(() => expect(screen.getByLabelText("Reconciliation Account")).toHaveValue("account-ledger"));
+    fireEvent.change(balance, { target: { value: "5.00" } });
+    fireEvent.change(screen.getByLabelText("Statement timestamp (UTC)"), {
+      target: { value: "2026-01-15T12:00" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Preview reconciliation" }));
+
+    expect(await screen.findByText("Discrepancy 5.00 BOB")).toBeInTheDocument();
+    expect(screen.getByText("Policy warn · tolerance 0.00 BOB")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("I explicitly accept this discrepancy warning."));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm reconciliation" }));
+    await screen.findByText(/Adjustment adjustment-/);
+
+    const previewCall = server.fetchMock.mock.calls.find(([path, init]) =>
+      String(path).endsWith("/preview") && init?.method === "POST");
+    const confirmCall = server.fetchMock.mock.calls.find(([path, init]) =>
+      String(path).includes("/reconciliations/") && !String(path).endsWith("/preview") && init?.method === "PUT");
+    expect(previewCall).toBeDefined();
+    expect(confirmCall).toBeDefined();
+    expect(String(confirmCall?.[0])).toBe(String(previewCall?.[0]).replace(/\/preview$/, ""));
+    expect(JSON.parse(String(confirmCall?.[1]?.body))).toEqual({
+      statement_balance: "5.00",
+      currency_code: "BOB",
+      statement_at: "2026-01-15T12:00:00.000Z",
+      warning_accepted: true,
+    });
   });
 });

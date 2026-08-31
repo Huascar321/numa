@@ -74,7 +74,7 @@ export type Transaction = {
   id: string;
   plan_id: string;
   account_id: string;
-  type: "income" | "expense" | "transfer";
+  type: "income" | "expense" | "transfer" | "reconciliation_adjustment";
   amount: string;
   currency_code: string;
   event_at: string;
@@ -101,6 +101,27 @@ export type Transfer = {
 };
 
 export type PlanActivityItem = Transaction | Transfer;
+
+export type ReconciliationComparison = {
+  id: string;
+  plan_id: string;
+  account_id: string;
+  statement_balance: Balance;
+  statement_at: string;
+  derived_balance: Balance;
+  discrepancy: Balance;
+  policy: "block" | "warn";
+  tolerance: Balance;
+  requires_warning_acceptance: boolean;
+  blocked: boolean;
+};
+
+export type ReconciliationSession = ReconciliationComparison & {
+  warning_accepted: boolean;
+  confirmed_at: string;
+  adjustment_transaction_id: string | null;
+  adjustment_movement_id: string | null;
+};
 
 export type TransactionCorrection = {
   id: string;
@@ -308,7 +329,7 @@ export function reverseTransfer(planId: string, transferId: string, reversalId: 
 }
 
 export type TransactionCreatePayload = {
-  type: Transaction["type"];
+  type: "income" | "expense";
   account_id: string;
   amount: string;
   currency_code: string;
@@ -410,4 +431,43 @@ export function archiveAccount(
   return request<Account>(`/plans/${planId}/accounts/${accountId}/archive`, {
     method: "POST",
   });
+}
+
+export type ReconciliationStatementPayload = {
+  statement_balance: string;
+  currency_code: string;
+  statement_at: string;
+};
+
+export function previewReconciliation(
+  planId: string,
+  accountId: string,
+  reconciliationId: string,
+  payload: ReconciliationStatementPayload,
+): Promise<ReconciliationComparison> {
+  return request<ReconciliationComparison>(
+    `/plans/${planId}/accounts/${accountId}/reconciliations/${reconciliationId}/preview`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+}
+
+export function confirmReconciliation(
+  planId: string,
+  accountId: string,
+  reconciliationId: string,
+  payload: ReconciliationStatementPayload & { warning_accepted: boolean },
+): Promise<ReconciliationSession> {
+  return request<ReconciliationSession>(
+    `/plans/${planId}/accounts/${accountId}/reconciliations/${reconciliationId}`,
+    { method: "PUT", body: JSON.stringify(payload) },
+  );
+}
+
+export function getReconciliations(
+  planId: string,
+  accountId: string,
+): Promise<ReconciliationSession[]> {
+  return request<ReconciliationSession[]>(
+    `/plans/${planId}/accounts/${accountId}/reconciliations`,
+  );
 }

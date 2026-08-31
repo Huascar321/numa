@@ -78,7 +78,7 @@ def test_clean_postgresql_18_database_reaches_accounts_head(
 
         config = _alembic_config(database_url)
         scripts = ScriptDirectory.from_config(config)
-        assert scripts.get_revision(EXPECTED_REVISION).down_revision == "004_transfers"
+        assert scripts.get_revision(EXPECTED_REVISION).down_revision == "005_budget_engine"
 
         command.upgrade(config, "head")
 
@@ -98,6 +98,7 @@ def test_clean_postgresql_18_database_reaches_accounts_head(
             "monthly_budget_assignments",
             "transfers",
             "transfer_legs",
+            "reconciliation_sessions",
         } <= set(
             database_inspector.get_table_names()
         )
@@ -304,4 +305,36 @@ def test_upgrade_from_ledger_core_then_repeated_head_and_readiness(
         assert before[0] == EXPECTED_REVISION
         assert {"transfers", "transfer_legs"} <= set(before[1])
         assert TestClient(create_app(Settings(database_url=database_url))).get("/health/ready").status_code == 200
+        engine.dispose()
+
+
+def test_upgrade_from_budget_engine_then_repeated_head_and_readiness(
+    postgres_url: str,
+) -> None:
+    with _temporary_database(postgres_url) as database_url:
+        config = _alembic_config(database_url)
+        command.upgrade(config, "005_budget_engine")
+        assert _current_revision(database_url) == "005_budget_engine"
+        assert TestClient(
+            create_app(Settings(database_url=database_url))
+        ).get("/health/ready").status_code == 503
+
+        command.upgrade(config, "head")
+        engine = create_engine(database_url)
+        before = (
+            _current_revision(database_url),
+            tuple(sorted(inspect(engine).get_table_names())),
+        )
+        command.upgrade(config, "head")
+        after = (
+            _current_revision(database_url),
+            tuple(sorted(inspect(engine).get_table_names())),
+        )
+
+        assert before == after
+        assert after[0] == EXPECTED_REVISION
+        assert "reconciliation_sessions" in after[1]
+        assert TestClient(
+            create_app(Settings(database_url=database_url))
+        ).get("/health/ready").status_code == 200
         engine.dispose()

@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import {
   Link,
   Navigate,
@@ -52,6 +52,11 @@ import {
   getTransfers,
   createTransfer,
   reverseTransfer,
+  ReconciliationComparison,
+  confirmReconciliation,
+  getReconciliations,
+  previewReconciliation,
+  ReconciliationStatementPayload,
 } from "./api";
 
 function ErrorMessage({ message }: { message: string }) {
@@ -463,7 +468,7 @@ function TransactionPanel({ planId, accounts, categories }: { planId: string; ac
   const [accountId, setAccountId] = useState(accounts[0]?.id ?? "");
   const [categoryId, setCategoryId] = useState("");
   const [amount, setAmount] = useState("");
-  const [type, setType] = useState<Transaction["type"]>("expense");
+  const [type, setType] = useState<"income" | "expense">("expense");
   const [eventAt, setEventAt] = useState(new Date().toISOString().slice(0, 16));
   const [merchant, setMerchant] = useState("");
   const [memo, setMemo] = useState("");
@@ -474,7 +479,10 @@ function TransactionPanel({ planId, accounts, categories }: { planId: string; ac
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [correctionAmount, setCorrectionAmount] = useState("");
-  const ordinaryTransactions = (transactions.data ?? []).filter((item): item is Transaction => !("legs" in item));
+  const ordinaryTransactions = (transactions.data ?? []).filter(
+    (item): item is Transaction => !("legs" in item)
+      && (item.type === "income" || item.type === "expense"),
+  );
   const selected = ordinaryTransactions.find((transaction) => transaction.id === selectedId) ?? null;
   useEffect(() => {
     if (!accountId && accounts[0]) setAccountId(accounts[0].id);
@@ -516,7 +524,7 @@ function TransactionPanel({ planId, accounts, categories }: { planId: string; ac
     <section className="panel" aria-labelledby="transactions-heading">
       <h2 id="transactions-heading">Manual Transactions</h2>
       <form className="form-grid" onSubmit={(event) => { event.preventDefault(); postMutation.mutate(); }}>
-        <label>Type<select value={type} onChange={(event) => setType(event.target.value as Transaction["type"])}><option value="expense">Expense</option><option value="income">Income</option></select></label>
+        <label>Type<select value={type} onChange={(event) => setType(event.target.value as "income" | "expense")}><option value="expense">Expense</option><option value="income">Income</option></select></label>
         <label>Account<select value={accountId} onChange={(event) => setAccountId(event.target.value)}>{accounts.filter((account) => account.status === "active").map((account) => <option key={account.id} value={account.id}>{account.name} · {account.currency_code}</option>)}</select></label>
         <label>Amount (exact decimal string)<input inputMode="decimal" value={amount} onChange={(event) => setAmount(event.target.value)} required /></label>
         <p className="field-help">Use an exact decimal string in {accounts.find((account) => account.id === accountId)?.currency_code ?? "the Account currency"}; floats are rejected.</p>
@@ -606,12 +614,174 @@ function TransferPanel({ planId, accounts }: { planId: string; accounts: Account
   );
 }
 
+type ReconciliationPreviewSnapshot = {
+  generation: number;
+  planId: string;
+  accountId: string;
+  sessionId: string;
+  statementBalance: string;
+  currencyCode: string;
+  statementAt: string;
+};
+
+type AcceptedReconciliationPreview = ReconciliationPreviewSnapshot & {
+  policy: ReconciliationComparison["policy"];
+  tolerance: ReconciliationComparison["tolerance"];
+  comparison: ReconciliationComparison;
+};
+
+function ReconciliationPanel({ planId, accounts }: { planId: string; accounts: Account[] }) {
+  const queryClient = useQueryClient();
+  const [accountId, setAccountId] = useState(accounts[0]?.id ?? "");
+  const [statementBalance, setStatementBalance] = useState("");
+  const [statementAt, setStatementAt] = useState(new Date().toISOString().slice(0, 16));
+  const [sessionId, setSessionId] = useState(newClientId());
+  const [acceptedPreview, setAcceptedPreview] = useState<AcceptedReconciliationPreview | null>(null);
+  const [previewPendingGeneration, setPreviewPendingGeneration] = useState<number | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [warningAccepted, setWarningAccepted] = useState(false);
+  const previewGeneration = useRef(0);
+  const selectedAccountId = accounts.some((item) => item.id === accountId)
+    ? accountId
+    : (accounts[0]?.id ?? "");
+  const account = accounts.find((item) => item.id === selectedAccountId);
+  const comparison = acceptedPreview?.comparison ?? null;
+  const statementPayload = (): ReconciliationStatementPayload => {
+    if (!account) throw new Error("Select an Account.");
+    return {
+      statement_balance: statementBalance,
+      currency_code: account.currency_code,
+      statement_at: new Date(`${statementAt}Z`).toISOString(),
+    };
+  };
+  const history = useQuery({
+    queryKey: ["plans", planId, "accounts", selectedAccountId, "reconciliations"],
+    queryFn: () => getReconciliations(planId, selectedAccountId),
+    enabled: Boolean(selectedAccountId),
+  });
+  const preview = useMutation({
+    mutationFn: (snapshot: ReconciliationPreviewSnapshot) => previewReconciliation(
+      snapshot.planId,
+      snapshot.accountId,
+      snapshot.sessionId,
+      {
+        statement_balance: snapshot.statementBalance,
+        currency_code: snapshot.currencyCode,
+        statement_at: snapshot.statementAt,
+      },
+    ),
+    onSuccess: (result, snapshot) => {
+      if (previewGeneration.current !== snapshot.generation) return;
+      setPreviewPendingGeneration(null);
+      if (result.plan_id !== snapshot.planId || result.account_id !== snapshot.accountId || result.id !== snapshot.sessionId) {
+        setPreviewError("The preview response did not match the requested reconciliation snapshot.");
+        return;
+      }
+      setAcceptedPreview({
+        ...snapshot,
+        policy: result.policy,
+        tolerance: { ...result.tolerance },
+        comparison: result,
+      });
+      setWarningAccepted(false);
+    },
+    onError: (error, snapshot) => {
+      if (previewGeneration.current !== snapshot.generation) return;
+      setPreviewPendingGeneration(null);
+      setPreviewError(error instanceof Error ? error.message : "Preview failed.");
+    },
+  });
+  const confirm = useMutation({
+    mutationFn: ({ snapshot, accepted }: { snapshot: AcceptedReconciliationPreview; accepted: boolean }) => confirmReconciliation(
+      snapshot.planId,
+      snapshot.accountId,
+      snapshot.sessionId,
+      {
+        statement_balance: snapshot.statementBalance,
+        currency_code: snapshot.currencyCode,
+        statement_at: snapshot.statementAt,
+        warning_accepted: accepted,
+      },
+    ),
+    onSuccess: async (_result, { snapshot }) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["plans", snapshot.planId, "accounts", snapshot.accountId, "reconciliations"] }),
+        queryClient.invalidateQueries({ queryKey: ["plans", snapshot.planId, "accounts"] }),
+        queryClient.invalidateQueries({ queryKey: ["plans", snapshot.planId, "transactions"] }),
+        queryClient.invalidateQueries({ queryKey: ["plans", snapshot.planId, "budget"] }),
+      ]);
+      setSessionId(newClientId());
+      setAcceptedPreview(null);
+      setWarningAccepted(false);
+    },
+  });
+  const invalidatePreview = () => {
+    previewGeneration.current += 1;
+    setAcceptedPreview(null);
+    setPreviewPendingGeneration(null);
+    setPreviewError(null);
+    setWarningAccepted(false);
+    preview.reset();
+    confirm.reset();
+  };
+  useEffect(() => {
+    invalidatePreview();
+    return () => { previewGeneration.current += 1; };
+  }, [planId, selectedAccountId, account?.currency_code]);
+  const requestPreview = () => {
+    const payload = statementPayload();
+    const generation = previewGeneration.current + 1;
+    previewGeneration.current = generation;
+    setAcceptedPreview(null);
+    setWarningAccepted(false);
+    setPreviewError(null);
+    setPreviewPendingGeneration(generation);
+    preview.mutate({
+      generation,
+      planId,
+      accountId: selectedAccountId,
+      sessionId,
+      statementBalance: payload.statement_balance,
+      currencyCode: payload.currency_code,
+      statementAt: payload.statement_at,
+    });
+  };
+  return (
+    <section className="panel" aria-labelledby="reconciliation-heading">
+      <h2 id="reconciliation-heading">Reconciliation</h2>
+      <form className="form-grid" onSubmit={(event) => { event.preventDefault(); requestPreview(); }}>
+        <label>Reconciliation Account<select disabled={confirm.isPending} value={selectedAccountId} onChange={(event) => { setAccountId(event.target.value); invalidatePreview(); }}>{accounts.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.currency_code}{item.status === "archived" ? " · archived" : ""}</option>)}</select></label>
+        <label>Statement balance (exact)<input disabled={confirm.isPending} required value={statementBalance} onChange={(event) => { setStatementBalance(event.target.value); invalidatePreview(); }} /></label>
+        <label>Statement timestamp (UTC)<input disabled={confirm.isPending} type="datetime-local" required value={statementAt} onChange={(event) => { setStatementAt(event.target.value); invalidatePreview(); }} /></label>
+        <button type="submit" disabled={previewPendingGeneration !== null || confirm.isPending || !selectedAccountId}>{previewPendingGeneration !== null ? "Previewing…" : "Preview reconciliation"}</button>
+      </form>
+      {previewError ? <ErrorMessage message={previewError} /> : null}
+      {comparison ? <div className="card reconciliation-preview">
+        <strong>Discrepancy {comparison.discrepancy.amount} {comparison.discrepancy.currency}</strong>
+        <p>Statement {comparison.statement_balance.amount} · Derived as of {comparison.statement_at}: {comparison.derived_balance.amount}</p>
+        <p>Policy {acceptedPreview?.policy} · tolerance {acceptedPreview?.tolerance.amount} {acceptedPreview?.tolerance.currency}</p>
+        {comparison.blocked ? <ErrorMessage message="Confirmation is blocked above the configured tolerance." /> : null}
+        {comparison.requires_warning_acceptance ? <label className="warning-acceptance"><input type="checkbox" checked={warningAccepted} onChange={(event) => setWarningAccepted(event.target.checked)} />I explicitly accept this discrepancy warning.</label> : null}
+        <button type="button" onClick={() => acceptedPreview && confirm.mutate({ snapshot: acceptedPreview, accepted: warningAccepted })} disabled={confirm.isPending || comparison.blocked || (comparison.requires_warning_acceptance && !warningAccepted)}>{confirm.isPending ? "Confirming…" : "Confirm reconciliation"}</button>
+      </div> : null}
+      {confirm.isError ? <ErrorMessage message={confirm.error.message} /> : null}
+      <h3>Reconciliation history</h3>
+      {history.isPending ? <p>Loading reconciliation history…</p> : null}
+      <div className="card-list">{history.data?.map((item) => <article className="card" key={item.id}>
+        <strong>{item.discrepancy.amount} {item.discrepancy.currency} discrepancy</strong>
+        <p>Statement {item.statement_balance.amount} · derived {item.derived_balance.amount} · {item.statement_at}</p>
+        <p>{item.adjustment_transaction_id ? `Adjustment ${item.adjustment_transaction_id}` : "Confirmed without adjustment"}</p>
+      </article>)}</div>
+    </section>
+  );
+}
+
 function LedgerScreen() {
   const { planId } = useParams<{ planId: string }>();
   const accounts = useQuery({ queryKey: ["plans", planId, "accounts"], queryFn: () => getAccounts(planId ?? ""), enabled: Boolean(planId) });
   const categories = useQuery({ queryKey: ["plans", planId, "categories"], queryFn: () => getCategories(planId ?? ""), enabled: Boolean(planId) });
   if (!planId) return <Navigate to="/plans" replace />;
-  return <main className="page"><header className="page-header"><Link to={`/plans/${planId}/accounts`}>← Accounts</Link><p className="eyebrow">Ledger</p><h1>Ledger</h1><p>Exact, Plan-scoped activity and monthly envelopes.</p></header><TaxonomyPanel planId={planId} /><TransactionPanel planId={planId} accounts={accounts.data ?? []} categories={categories.data ?? []} /><TransferPanel planId={planId} accounts={accounts.data ?? []} /><BudgetPanel planId={planId} categories={categories.data ?? []} /></main>;
+  return <main className="page"><header className="page-header"><Link to={`/plans/${planId}/accounts`}>← Accounts</Link><p className="eyebrow">Ledger</p><h1>Ledger</h1><p>Exact, Plan-scoped activity and monthly envelopes.</p></header><TaxonomyPanel planId={planId} /><TransactionPanel planId={planId} accounts={accounts.data ?? []} categories={categories.data ?? []} /><TransferPanel planId={planId} accounts={accounts.data ?? []} /><ReconciliationPanel planId={planId} accounts={accounts.data ?? []} /><BudgetPanel planId={planId} categories={categories.data ?? []} /></main>;
 }
 
 export function AppRoutes() {

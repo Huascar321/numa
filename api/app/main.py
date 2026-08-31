@@ -4,6 +4,7 @@ from fastapi import FastAPI, Response, status
 
 from app.accounts.routes import router as accounts_router
 from app.ledger.routes import router as ledger_router
+from app.reconciliation.routes import router as reconciliation_router
 from app.db import database_is_ready
 from app.settings import Settings
 
@@ -13,6 +14,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.settings = settings or Settings()
     application.include_router(accounts_router)
     application.include_router(ledger_router)
+    application.include_router(reconciliation_router)
 
     @application.get("/health/live")
     def live() -> dict[str, str]:

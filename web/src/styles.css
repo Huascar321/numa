@@ -200,3 +200,14 @@ select {
   color: #9a3412;
   font-weight: 600;
 }
+
+.reconciliation-preview {
+  margin-top: 1rem;
+}
+
+.warning-acceptance {
+  align-items: center;
+  display: flex;
+  flex-direction: row;
+  margin: 0.75rem 0;
+}

@@ -155,7 +155,12 @@ class Transaction(Base):
     __tablename__ = "transactions"
     __table_args__ = (
         CheckConstraint(
-            "type IN ('income', 'expense', 'transfer')", name="ck_transactions_type"
+            "type IN ('income', 'expense', 'transfer', 'reconciliation_adjustment')",
+            name="ck_transactions_type",
+        ),
+        CheckConstraint(
+            "(type = 'reconciliation_adjustment') = (reconciliation_session_id IS NOT NULL)",
+            name="ck_transactions_reconciliation_link",
         ),
         CheckConstraint("amount > 0", name="ck_transactions_amount_positive"),
         CheckConstraint(
@@ -176,7 +181,19 @@ class Transaction(Base):
             ["currencies.code"],
             name="fk_transactions_currency_code_currencies",
         ),
+        ForeignKeyConstraint(
+            ["plan_id", "reconciliation_session_id"],
+            ["reconciliation_sessions.plan_id", "reconciliation_sessions.id"],
+            name="fk_transactions_reconciliation_session_same_plan",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         UniqueConstraint("plan_id", "id", name="uq_transactions_plan_id_id"),
+        UniqueConstraint(
+            "plan_id",
+            "reconciliation_session_id",
+            name="uq_transactions_reconciliation_session",
+        ),
         Index("ix_transactions_plan_event_at", "plan_id", "event_at"),
         Index("ix_transactions_plan_category_event", "plan_id", "category_id", "event_at"),
     )
@@ -224,6 +241,9 @@ class Transaction(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    reconciliation_session_id: Mapped[UUID | None] = mapped_column(
+        LedgerUUID, nullable=True
     )
 
 
@@ -289,8 +309,13 @@ class PostedAccountMovement(Base):
             "signed_amount <> 0", name="ck_posted_movements_amount_nonzero"
         ),
         CheckConstraint(
-            "transaction_type IN ('income', 'expense', 'transfer')",
+            "transaction_type IN ('income', 'expense', 'transfer', 'reconciliation_adjustment')",
             name="ck_posted_movements_transaction_type",
+        ),
+        CheckConstraint(
+            "(transaction_type = 'reconciliation_adjustment') = "
+            "(reconciliation_session_id IS NOT NULL)",
+            name="ck_posted_movements_reconciliation_link",
         ),
         CheckConstraint(
             "movement_kind IN ('original', 'compensation', 'replacement')",
@@ -337,6 +362,18 @@ class PostedAccountMovement(Base):
             ["currencies.code"],
             name="fk_posted_movements_currency_code_currencies",
         ),
+        ForeignKeyConstraint(
+            ["plan_id", "reconciliation_session_id"],
+            ["reconciliation_sessions.plan_id", "reconciliation_sessions.id"],
+            name="fk_posted_movements_reconciliation_session_same_plan",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        UniqueConstraint(
+            "plan_id",
+            "reconciliation_session_id",
+            name="uq_posted_movements_reconciliation_session",
+        ),
         Index("ix_posted_movements_account_effective", "plan_id", "account_id", "effective_at"),
         Index("ix_posted_movements_budget", "plan_id", "effective_at", "category_id"),
     )
@@ -368,6 +405,9 @@ class PostedAccountMovement(Base):
     movement_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     posted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    reconciliation_session_id: Mapped[UUID | None] = mapped_column(
+        LedgerUUID, nullable=True
     )
 
 

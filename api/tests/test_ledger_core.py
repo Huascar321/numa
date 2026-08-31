@@ -934,7 +934,17 @@ def test_no_forbidden_ledger_capabilities(client: TestClient) -> None:
     assert "/plans/{plan_id}/transfers/{transfer_id}" in paths
     assert "/plans/{plan_id}/transfers" in paths
     assert "/plans/{plan_id}/transfers/{transfer_id}/reversals/{reversal_id}" in paths
-    forbidden = ("cleared", "reconciliation", "rollover", "goal", "target", "fx")
+    reconciliation_paths = {
+        path: set(operations)
+        for path, operations in paths.items()
+        if "reconciliation" in path.lower()
+    }
+    assert reconciliation_paths == {
+        "/plans/{plan_id}/accounts/{account_id}/reconciliations": {"get"},
+        "/plans/{plan_id}/accounts/{account_id}/reconciliations/{reconciliation_id}": {"put"},
+        "/plans/{plan_id}/accounts/{account_id}/reconciliations/{reconciliation_id}/preview": {"post"},
+    }
+    forbidden = ("cleared", "rollover", "goal", "target", "fx")
     assert not any(any(word in path.lower() for word in forbidden) for path in paths)
 
 

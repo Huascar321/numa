@@ -602,6 +602,25 @@ def transaction_snapshot(
     }
 
 
+def lock_movement_accounts(
+    session: Session, plan_id: UUID, account_ids: Iterable[UUID]
+) -> dict[UUID, Account]:
+    """Serialize all movement writers on Account rows in deterministic order."""
+
+    locked: dict[UUID, Account] = {}
+    for account_id in sorted(set(account_ids), key=lambda value: value.int):
+        account = session.scalar(
+            select(Account)
+            .where(Account.plan_id == plan_id, Account.id == account_id)
+            .execution_options(populate_existing=True)
+            .with_for_update(of=Account)
+        )
+        if account is None:
+            raise ResourceNotFound("Account not found")
+        locked[account_id] = account
+    return locked
+
+
 def create_transaction(
     session: Session,
     *,
@@ -610,11 +629,9 @@ def create_transaction(
     payload: TransactionCreate,
 ) -> CreationResult[Transaction]:
     plan = _get_plan(session, plan_id)
-    account = session.scalar(
-        select(Account).where(Account.plan_id == plan_id, Account.id == payload.account_id)
-    )
-    if account is None:
-        raise ResourceNotFound("Account not found")
+    account = lock_movement_accounts(session, plan_id, [payload.account_id])[
+        payload.account_id
+    ]
     if account.status != "active":
         raise ArchivedResource("archived Accounts reject new postings")
     if payload.currency_code != account.currency_code:
@@ -727,10 +744,9 @@ def create_transaction(
 def _transfer_accounts(session: Session, plan_id: UUID, source_id: UUID, destination_id: UUID) -> tuple[Account, Account]:
     if source_id == destination_id:
         raise LedgerValidationError("source and destination Accounts must differ")
-    source = session.scalar(select(Account).where(Account.plan_id == plan_id, Account.id == source_id))
-    destination = session.scalar(select(Account).where(Account.plan_id == plan_id, Account.id == destination_id))
-    if source is None or destination is None:
-        raise ResourceNotFound("Account not found")
+    accounts = lock_movement_accounts(session, plan_id, [source_id, destination_id])
+    source = accounts[source_id]
+    destination = accounts[destination_id]
     if source.status != "active" or destination.status != "active":
         raise ArchivedResource("archived Accounts reject new postings")
     return source, destination
@@ -1058,11 +1074,13 @@ def correct_transaction(
     correction_id: UUID,
     payload: TransactionCorrectionCreate,
 ) -> CreationResult[TransactionCorrection]:
-    # This lock is the correction serialization boundary. It deliberately
-    # precedes every snapshot, Tag-state, and effective-movement read.
+    # Serialize corrections per Transaction before taking the shared Account
+    # movement locks below.
     transaction = _get_transaction_for_update(session, plan_id, transaction_id)
     if transaction.type == "transfer":
         raise CreationConflict("transfer Transactions may only be reversed as a paired Transfer")
+    if transaction.type == "reconciliation_adjustment":
+        raise CreationConflict("reconciliation adjustments are immutable and cannot be corrected")
     existing_correction = session.scalar(
         select(TransactionCorrection).where(TransactionCorrection.id == correction_id)
     )
@@ -1075,6 +1093,18 @@ def correct_transaction(
             return CreationResult(existing_correction, False)
         raise CreationConflict("Correction UUID has a different creation payload")
 
+    fields = payload.model_fields_set
+    if "account_id" in fields and payload.account_id is None:
+        raise LedgerValidationError("correction account_id cannot be null")
+    target_account_id = (
+        payload.account_id if "account_id" in fields else transaction.account_id
+    )
+    assert target_account_id is not None
+    accounts = lock_movement_accounts(
+        session, plan_id, [transaction.account_id, target_account_id]
+    )
+    target_account = accounts[target_account_id]
+
     before_tags = _tag_state(session, plan_id, transaction_id)
     before = transaction_snapshot(session, transaction, tags=before_tags)
     old_movement = _current_movement(session, plan_id, transaction_id)
@@ -1085,25 +1115,6 @@ def correct_transaction(
         )
     ) or 0
     correction_sequence = int(latest_sequence) + 1
-    fields = payload.model_fields_set
-    current_account = session.scalar(
-        select(Account).where(
-            Account.plan_id == plan_id, Account.id == transaction.account_id
-        )
-    )
-    if current_account is None:
-        raise RuntimeError("Transaction Account could not be loaded")
-    if "account_id" in fields and payload.account_id is None:
-        raise LedgerValidationError("correction account_id cannot be null")
-    target_account_id = (
-        payload.account_id if "account_id" in fields else transaction.account_id
-    )
-    assert target_account_id is not None
-    target_account = session.scalar(
-        select(Account).where(Account.plan_id == plan_id, Account.id == target_account_id)
-    )
-    if target_account is None:
-        raise ResourceNotFound("Account not found")
     if target_account.status != "active":
         raise ArchivedResource("archived Accounts reject correction destinations")
     target_currency = target_account.currency_code

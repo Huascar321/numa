@@ -203,7 +203,7 @@ class TransactionResponse(BaseModel):
     id: UUID
     plan_id: UUID
     account_id: UUID
-    type: Literal["income", "expense", "transfer"]
+    type: Literal["income", "expense", "transfer", "reconciliation_adjustment"]
     amount: StrictStr
     currency_code: str
     event_at: datetime
