@@ -42,7 +42,6 @@ class CategoryGroup(Base):
         UniqueConstraint("plan_id", "name", name="uq_category_groups_plan_name"),
         Index("ix_category_groups_plan_id", "plan_id"),
     )
-
     id: Mapped[UUID] = mapped_column(LedgerUUID, primary_key=True, default=uuid4)
     plan_id: Mapped[UUID] = mapped_column(
         LedgerUUID,
@@ -155,7 +154,8 @@ class Transaction(Base):
     __tablename__ = "transactions"
     __table_args__ = (
         CheckConstraint(
-            "type IN ('income', 'expense', 'transfer')", name="ck_transactions_type"
+            "type IN ('income', 'expense', 'transfer', 'reconciliation_adjustment')",
+            name="ck_transactions_type",
         ),
         CheckConstraint("amount > 0", name="ck_transactions_amount_positive"),
         CheckConstraint(
@@ -289,7 +289,7 @@ class PostedAccountMovement(Base):
             "signed_amount <> 0", name="ck_posted_movements_amount_nonzero"
         ),
         CheckConstraint(
-            "transaction_type IN ('income', 'expense', 'transfer')",
+            "transaction_type IN ('income', 'expense', 'transfer', 'reconciliation_adjustment')",
             name="ck_posted_movements_transaction_type",
         ),
         CheckConstraint(
@@ -479,6 +479,70 @@ class MonthlyBudgetAssignment(Base):
     amount: Mapped[Decimal] = mapped_column(LedgerMoney, nullable=False)
     currency_code: Mapped[str] = mapped_column(String(16), nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
+    provenance: Mapped[dict[str, Any]] = mapped_column(
+        LedgerJSON, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    creation_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
+class ReconciliationSession(Base):
+    __tablename__ = "reconciliation_sessions"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('balanced', 'adjusted')",
+            name="ck_reconciliation_sessions_status",
+        ),
+        CheckConstraint(
+            "(status = 'balanced' AND adjustment_transaction_id IS NULL AND discrepancy = 0) OR "
+            "(status = 'adjusted' AND adjustment_transaction_id IS NOT NULL AND discrepancy <> 0)",
+            name="ck_reconciliation_sessions_adjustment",
+        ),
+        ForeignKeyConstraint(
+            ["plan_id"],
+            ["plans.id"],
+            name="fk_reconciliation_sessions_plan_id_plans",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["plan_id", "account_id"],
+            ["accounts.plan_id", "accounts.id"],
+            name="fk_reconciliation_sessions_plan_account_same_plan",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["currency_code"],
+            ["currencies.code"],
+            name="fk_reconciliation_sessions_currency_code_currencies",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["plan_id", "adjustment_transaction_id"],
+            ["transactions.plan_id", "transactions.id"],
+            name="fk_reconciliation_sessions_plan_transaction_same_plan",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("plan_id", "id", name="uq_reconciliation_sessions_plan_id_id"),
+        Index("ix_reconciliation_sessions_plan_account", "plan_id", "account_id", "statement_date"),
+    )
+
+    id: Mapped[UUID] = mapped_column(LedgerUUID, primary_key=True, default=uuid4)
+    plan_id: Mapped[UUID] = mapped_column(LedgerUUID, nullable=False)
+    account_id: Mapped[UUID] = mapped_column(LedgerUUID, nullable=False)
+    statement_balance: Mapped[Decimal] = mapped_column(LedgerMoney, nullable=False)
+    statement_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    derived_balance: Mapped[Decimal] = mapped_column(LedgerMoney, nullable=False)
+    discrepancy: Mapped[Decimal] = mapped_column(LedgerMoney, nullable=False)
+    currency_code: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    adjustment_transaction_id: Mapped[UUID | None] = mapped_column(LedgerUUID, nullable=True)
+    memo: Mapped[str | None] = mapped_column(Text, nullable=True)
     provenance: Mapped[dict[str, Any]] = mapped_column(
         LedgerJSON, nullable=False, server_default=text("'{}'::jsonb")
     )

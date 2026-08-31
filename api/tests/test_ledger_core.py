@@ -40,7 +40,7 @@ pytestmark = pytest.mark.postgres
 @pytest.fixture(autouse=True)
 def clean_ledger(postgres_sessions: sessionmaker[Session]):
     statement = text(
-        "TRUNCATE transfer_legs, transfers, transaction_tags, posted_account_movements, "
+        "TRUNCATE reconciliation_sessions, transfer_legs, transfers, transaction_tags, posted_account_movements, "
         "transaction_corrections, monthly_budget_assignments, transactions, "
         "tags, categories, category_groups, accounts, plans CASCADE"
     )
@@ -934,8 +934,14 @@ def test_no_forbidden_ledger_capabilities(client: TestClient) -> None:
     assert "/plans/{plan_id}/transfers/{transfer_id}" in paths
     assert "/plans/{plan_id}/transfers" in paths
     assert "/plans/{plan_id}/transfers/{transfer_id}/reversals/{reversal_id}" in paths
-    forbidden = ("cleared", "reconciliation", "rollover", "goal", "target", "fx")
-    assert not any(any(word in path.lower() for word in forbidden) for path in paths)
+    forbidden = ("cleared", "rollover", "goal", "target", "fx")
+    ledger_paths = [
+        p
+        for p in paths
+        if not p.startswith("/plans/{plan_id}/analytics")
+        and not p.startswith("/plans/{plan_id}/fx")
+    ]
+    assert not any(any(word in path.lower() for word in forbidden) for path in ledger_paths)
 
 
 def test_budget_rollover_overspending_card_and_goals(client: TestClient) -> None:

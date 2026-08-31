@@ -12,7 +12,18 @@ from app.accounts.models import Account
 from app.accounts.schemas import BalanceResponse
 from app.accounts.service import account_balance, get_account, get_plan
 from app.db import session_scope
-from app.ledger.models import Category, CategoryGroup, MonthlyBudgetAssignment, Tag, Transaction, TransactionCorrection, Transfer, TransferLeg, PostedAccountMovement
+from app.ledger.models import (
+    Category,
+    CategoryGroup,
+    MonthlyBudgetAssignment,
+    PostedAccountMovement,
+    ReconciliationSession,
+    Tag,
+    Transaction,
+    TransactionCorrection,
+    Transfer,
+    TransferLeg,
+)
 from app.ledger.schemas import (
     AssignmentCreate,
     AssignmentResponse,
@@ -24,6 +35,10 @@ from app.ledger.schemas import (
     CategoryPatch,
     CategoryResponse,
     MonthlySummaryResponse,
+    ReconciliationConfirmRequest,
+    ReconciliationPreviewRequest,
+    ReconciliationPreviewResponse,
+    ReconciliationSessionResponse,
     TagCreate,
     TagPatch,
     TagResponse,
@@ -46,27 +61,31 @@ from app.ledger.service import (
     archive_tag,
     assignment_response,
     category_envelope,
+    confirm_reconciliation,
     correct_transaction,
     create_assignment,
     create_category,
     create_category_group,
     create_tag,
     create_transaction,
+    create_transfer,
+    get_reconciliation,
     get_transaction,
+    get_transfer,
     list_categories,
     list_category_groups,
     list_corrections,
+    list_reconciliations,
     list_tags,
     list_transactions,
+    list_transfers,
     monthly_summary,
     patch_category,
     patch_category_group,
     patch_tag,
-    transaction_snapshot,
-    create_transfer,
-    get_transfer,
-    list_transfers,
+    preview_reconciliation,
     reverse_transfer,
+    transaction_snapshot,
 )
 from app.accounts.service import CreationConflict, ResourceNotFound, require_currency
 from app.ledger.service import fixed_amount
@@ -167,6 +186,30 @@ def _transfer_response(session: Session, transfer: Transfer) -> TransferResponse
     return TransferResponse.model_validate(result)
 
 
+def _reconciliation_response(
+    session: Session, rec: ReconciliationSession
+) -> ReconciliationSessionResponse:
+    currency = require_currency(session, rec.currency_code)
+    return ReconciliationSessionResponse.model_validate(
+        {
+            "id": rec.id,
+            "plan_id": rec.plan_id,
+            "account_id": rec.account_id,
+            "statement_balance": fixed_amount(Decimal(rec.statement_balance), currency),
+            "statement_date": rec.statement_date,
+            "derived_balance": fixed_amount(Decimal(rec.derived_balance), currency),
+            "discrepancy": fixed_amount(Decimal(rec.discrepancy), currency),
+            "currency_code": rec.currency_code,
+            "status": rec.status,
+            "adjustment_transaction_id": rec.adjustment_transaction_id,
+            "memo": rec.memo,
+            "provenance": rec.provenance,
+            "created_at": rec.created_at,
+        }
+    )
+
+
+
 @router.get(
     "/plans/{plan_id}/accounts/{account_id}/balance",
     response_model=BalanceResponse,
@@ -181,7 +224,6 @@ def get_account_balance(
         return account_balance(session, account)
     except ResourceNotFound as exc:
         raise _not_found(exc) from exc
-
 
 @router.put("/plans/{plan_id}/transfers/{transfer_id}", response_model=TransferResponse, response_model_exclude_none=True, status_code=status.HTTP_201_CREATED)
 def put_transfer(plan_id: UUID, transfer_id: UUID, payload: TransferCreate, response: Response,
@@ -693,3 +735,93 @@ def get_month_category(
         raise _not_found(exc) from exc
     except LedgerValidationError as exc:
         raise _invalid(exc) from exc
+
+
+@router.post(
+    "/plans/{plan_id}/accounts/{account_id}/reconciliations/preview",
+    response_model=ReconciliationPreviewResponse,
+)
+def post_reconciliation_preview(
+    plan_id: UUID,
+    account_id: UUID,
+    payload: ReconciliationPreviewRequest,
+    session: Session = Depends(get_database_session),
+) -> ReconciliationPreviewResponse:
+    try:
+        preview = preview_reconciliation(
+            session, plan_id=plan_id, account_id=account_id, payload=payload
+        )
+        return ReconciliationPreviewResponse.model_validate(preview)
+    except ResourceNotFound as exc:
+        raise _not_found(exc) from exc
+    except (LedgerValidationError, ValueError) as exc:
+        raise _invalid(exc) from exc
+
+
+@router.put(
+    "/plans/{plan_id}/accounts/{account_id}/reconciliations/{reconciliation_id}",
+    response_model=ReconciliationSessionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def put_reconciliation_confirm(
+    plan_id: UUID,
+    account_id: UUID,
+    reconciliation_id: UUID,
+    payload: ReconciliationConfirmRequest,
+    response: Response,
+    session: Session = Depends(get_database_session),
+) -> ReconciliationSessionResponse:
+    try:
+        with session.begin():
+            result = confirm_reconciliation(
+                session,
+                plan_id=plan_id,
+                account_id=account_id,
+                reconciliation_id=reconciliation_id,
+                payload=payload,
+            )
+            rec_response = _reconciliation_response(session, result.resource)
+    except CreationConflict as exc:
+        raise _conflict(exc) from exc
+    except ResourceNotFound as exc:
+        raise _not_found(exc) from exc
+    except (LedgerValidationError, ValueError) as exc:
+        raise _invalid(exc) from exc
+    if not result.created:
+        response.status_code = status.HTTP_200_OK
+    return rec_response
+
+
+@router.get(
+    "/plans/{plan_id}/accounts/{account_id}/reconciliations",
+    response_model=list[ReconciliationSessionResponse],
+)
+def get_account_reconciliations(
+    plan_id: UUID,
+    account_id: UUID,
+    session: Session = Depends(get_database_session),
+) -> list[ReconciliationSessionResponse]:
+    try:
+        return [
+            _reconciliation_response(session, item)
+            for item in list_reconciliations(session, plan_id, account_id)
+        ]
+    except ResourceNotFound as exc:
+        raise _not_found(exc) from exc
+
+
+@router.get(
+    "/plans/{plan_id}/accounts/{account_id}/reconciliations/{reconciliation_id}",
+    response_model=ReconciliationSessionResponse,
+)
+def get_account_reconciliation(
+    plan_id: UUID,
+    account_id: UUID,
+    reconciliation_id: UUID,
+    session: Session = Depends(get_database_session),
+) -> ReconciliationSessionResponse:
+    try:
+        item = get_reconciliation(session, plan_id, account_id, reconciliation_id)
+        return _reconciliation_response(session, item)
+    except ResourceNotFound as exc:
+        raise _not_found(exc) from exc

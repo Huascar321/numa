@@ -22,7 +22,7 @@ pytestmark = pytest.mark.postgres
 
 @pytest.fixture(autouse=True)
 def clean(postgres_sessions: sessionmaker[Session]):
-    statement = text("TRUNCATE transfer_legs, transfers, transaction_tags, posted_account_movements, transaction_corrections, monthly_budget_assignments, transactions, tags, categories, category_groups, accounts, plans CASCADE")
+    statement = text("TRUNCATE reconciliation_sessions, transfer_legs, transfers, transaction_tags, posted_account_movements, transaction_corrections, monthly_budget_assignments, transactions, tags, categories, category_groups, accounts, plans CASCADE")
     with postgres_sessions.begin() as session:
         session.execute(statement)
     yield

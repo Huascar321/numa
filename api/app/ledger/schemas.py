@@ -198,12 +198,11 @@ class TransactionCorrectionResponse(BaseModel):
     provenance: dict[str, Any]
     created_at: datetime
 
-
 class TransactionResponse(BaseModel):
     id: UUID
     plan_id: UUID
     account_id: UUID
-    type: Literal["income", "expense", "transfer"]
+    type: Literal["income", "expense", "transfer", "reconciliation_adjustment"]
     amount: StrictStr
     currency_code: str
     event_at: datetime
@@ -372,3 +371,57 @@ class MonthlySummaryResponse(BaseModel):
     available_total: StrictStr
     unconverted_by_currency: list[UnconvertedCurrencyResponse]
     categories: list[CategoryEnvelopeResponse]
+
+
+class ReconciliationPreviewRequest(StrictRequest):
+    statement_balance: StrictStr
+    statement_date: datetime
+
+    @field_validator("statement_date")
+    @classmethod
+    def validate_statement_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("statement_date must include a timezone offset")
+        return value
+
+
+class ReconciliationPreviewResponse(BaseModel):
+    account_id: UUID
+    currency_code: str
+    statement_balance: StrictStr
+    statement_date: datetime
+    derived_balance: StrictStr
+    discrepancy: StrictStr
+    status: Literal["balanced", "adjusted"]
+
+
+class ReconciliationConfirmRequest(StrictRequest):
+    statement_balance: StrictStr
+    statement_date: datetime
+    memo: StrictStr | None = None
+    provenance: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("statement_date")
+    @classmethod
+    def validate_statement_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("statement_date must include a timezone offset")
+        return value
+
+
+class ReconciliationSessionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    plan_id: UUID
+    account_id: UUID
+    statement_balance: StrictStr
+    statement_date: datetime
+    derived_balance: StrictStr
+    discrepancy: StrictStr
+    currency_code: str
+    status: Literal["balanced", "adjusted"]
+    adjustment_transaction_id: UUID | None = None
+    memo: str | None = None
+    provenance: dict[str, Any]
+    created_at: datetime

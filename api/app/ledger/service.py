@@ -26,6 +26,7 @@ from app.ledger.models import (
     CategoryGroup,
     MonthlyBudgetAssignment,
     PostedAccountMovement,
+    ReconciliationSession,
     Tag,
     Transaction,
     TransactionCorrection,
@@ -40,6 +41,8 @@ from app.ledger.schemas import (
     CategoryGroupCreate,
     CategoryGroupPatch,
     CategoryPatch,
+    ReconciliationConfirmRequest,
+    ReconciliationPreviewRequest,
     TagCreate,
     TagPatch,
     TransactionCorrectionCreate,
@@ -1063,6 +1066,8 @@ def correct_transaction(
     transaction = _get_transaction_for_update(session, plan_id, transaction_id)
     if transaction.type == "transfer":
         raise CreationConflict("transfer Transactions may only be reversed as a paired Transfer")
+    if transaction.type == "reconciliation_adjustment":
+        raise CreationConflict("reconciliation adjustment Transactions cannot be corrected")
     existing_correction = session.scalar(
         select(TransactionCorrection).where(TransactionCorrection.id == correction_id)
     )
@@ -1368,7 +1373,9 @@ def create_assignment(
             provenance=payload.provenance,
             creation_fingerprint=request_fingerprint,
         )
-        .on_conflict_do_nothing(index_elements=(MonthlyBudgetAssignment.id,))
+        .on_conflict_do_nothing(
+            index_elements=(MonthlyBudgetAssignment.plan_id, MonthlyBudgetAssignment.id)
+        )
         .returning(MonthlyBudgetAssignment.id)
     )
     assignment = session.scalar(
@@ -1745,3 +1752,249 @@ def monthly_summary(
         "unconverted_by_currency": _unconverted_summary(session, plan, movements),
         "categories": envelopes,
     }
+
+
+def _derived_account_balance_at(session: Session, account: Account, as_of: datetime) -> Decimal:
+    currency = require_currency(session, account.currency_code)
+    scale = Decimal(1).scaleb(-currency.decimal_places)
+    amount = session.scalar(
+        select(func.coalesce(func.sum(PostedAccountMovement.signed_amount), 0)).where(
+            PostedAccountMovement.plan_id == account.plan_id,
+            PostedAccountMovement.account_id == account.id,
+            PostedAccountMovement.currency_code == account.currency_code,
+            PostedAccountMovement.effective_at <= as_of,
+        )
+    ) or Decimal(0)
+    amount = Decimal(amount)
+    integer_digits = max(amount.adjusted() + 1, 1) if amount else 1
+    precision = max(
+        len(amount.as_tuple().digits),
+        integer_digits + currency.decimal_places,
+        currency.decimal_places + 1,
+    )
+    with localcontext() as context:
+        context.prec = precision
+        return amount.quantize(scale)
+
+
+def preview_reconciliation(
+    session: Session,
+    *,
+    plan_id: UUID,
+    account_id: UUID,
+    payload: ReconciliationPreviewRequest,
+) -> dict[str, Any]:
+    _get_plan(session, plan_id)
+    account = session.scalar(
+        select(Account).where(Account.plan_id == plan_id, Account.id == account_id)
+    )
+    if account is None:
+        raise ResourceNotFound("Account not found")
+    if account.status != "active":
+        raise ArchivedResource("archived Accounts reject reconciliation")
+    currency = require_currency(session, account.currency_code)
+    statement_date = require_aware_timestamp(payload.statement_date)
+    statement_balance = amount_for_currency(
+        session, payload.statement_balance, account.currency_code, positive=False
+    )
+    derived = _derived_account_balance_at(session, account, statement_date)
+    discrepancy = statement_balance - derived
+    with localcontext() as context:
+        context.prec = max(
+            len(discrepancy.as_tuple().digits),
+            max(discrepancy.adjusted() + 1, 1) + currency.decimal_places,
+            currency.decimal_places + 1,
+        )
+        discrepancy = discrepancy.quantize(Decimal(1).scaleb(-currency.decimal_places))
+    status = "balanced" if discrepancy == 0 else "adjusted"
+    return {
+        "account_id": account_id,
+        "currency_code": account.currency_code,
+        "statement_balance": fixed_amount(statement_balance, currency),
+        "statement_date": statement_date,
+        "derived_balance": fixed_amount(derived, currency),
+        "discrepancy": fixed_amount(discrepancy, currency),
+        "status": status,
+    }
+
+
+def confirm_reconciliation(
+    session: Session,
+    *,
+    plan_id: UUID,
+    account_id: UUID,
+    reconciliation_id: UUID,
+    payload: ReconciliationConfirmRequest,
+) -> CreationResult[ReconciliationSession]:
+    _get_plan(session, plan_id)
+    account = session.scalar(
+        select(Account).where(Account.plan_id == plan_id, Account.id == account_id)
+    )
+    if account is None:
+        raise ResourceNotFound("Account not found")
+    if account.status != "active":
+        raise ArchivedResource("archived Accounts reject reconciliation")
+    currency = require_currency(session, account.currency_code)
+    statement_date = require_aware_timestamp(payload.statement_date)
+    statement_balance = amount_for_currency(
+        session, payload.statement_balance, account.currency_code, positive=False
+    )
+    request_fingerprint = fingerprint(
+        {
+            "plan_id": plan_id,
+            "account_id": account_id,
+            "reconciliation_id": reconciliation_id,
+            "statement_balance": fixed_amount(statement_balance, currency),
+            "statement_date": statement_date,
+            "memo": payload.memo,
+            "provenance": payload.provenance,
+        }
+    )
+    existing = session.scalar(
+        select(ReconciliationSession).where(
+            ReconciliationSession.plan_id == plan_id,
+            ReconciliationSession.id == reconciliation_id,
+        )
+    )
+    if existing is not None:
+        if existing.account_id != account_id or existing.creation_fingerprint != request_fingerprint:
+            raise CreationConflict("Reconciliation session UUID has a different creation payload")
+        return CreationResult(existing, False)
+
+    derived = _derived_account_balance_at(session, account, statement_date)
+    discrepancy = statement_balance - derived
+    with localcontext() as context:
+        context.prec = max(
+            len(discrepancy.as_tuple().digits),
+            max(discrepancy.adjusted() + 1, 1) + currency.decimal_places,
+            currency.decimal_places + 1,
+        )
+        discrepancy = discrepancy.quantize(Decimal(1).scaleb(-currency.decimal_places))
+    status = "balanced" if discrepancy == 0 else "adjusted"
+
+    adjustment_transaction_id: UUID | None = None
+    if status == "adjusted":
+        pending = _pending_category(session, plan_id)
+        adj_id = uuid4()
+        adj_amount = abs(discrepancy)
+        adj_fingerprint = fingerprint(
+            {
+                "reconciliation_session_id": reconciliation_id,
+                "plan_id": plan_id,
+                "account_id": account_id,
+                "type": "reconciliation_adjustment",
+                "amount": fixed_amount(adj_amount, currency),
+                "statement_date": statement_date,
+            }
+        )
+        session.add(
+            Transaction(
+                id=adj_id,
+                plan_id=plan_id,
+                account_id=account.id,
+                type="reconciliation_adjustment",
+                amount=adj_amount,
+                currency_code=account.currency_code,
+                event_at=statement_date,
+                category_id=pending.id,
+                merchant="Reconciliation Adjustment",
+                memo=payload.memo or "Reconciliation adjustment",
+                source="reconciliation",
+                source_metadata={},
+                provenance=payload.provenance,
+                creation_fingerprint=adj_fingerprint,
+            )
+        )
+        session.flush()
+        session.add(
+            PostedAccountMovement(
+                id=uuid4(),
+                plan_id=plan_id,
+                account_id=account.id,
+                transaction_id=adj_id,
+                currency_code=account.currency_code,
+                signed_amount=discrepancy,
+                transaction_type="reconciliation_adjustment",
+                effective_at=statement_date,
+                category_id=pending.id,
+                merchant="Reconciliation Adjustment",
+                memo=payload.memo or "Reconciliation adjustment",
+                source="reconciliation",
+                source_metadata={},
+                provenance=payload.provenance,
+                movement_kind="original",
+                correction_sequence=0,
+                posted_at=utc_now(),
+            )
+        )
+        session.flush()
+        adjustment_transaction_id = adj_id
+
+    session.add(
+        ReconciliationSession(
+            id=reconciliation_id,
+            plan_id=plan_id,
+            account_id=account.id,
+            statement_balance=statement_balance,
+            statement_date=statement_date,
+            derived_balance=derived,
+            discrepancy=discrepancy,
+            currency_code=account.currency_code,
+            status=status,
+            adjustment_transaction_id=adjustment_transaction_id,
+            memo=payload.memo,
+            provenance=payload.provenance,
+            creation_fingerprint=request_fingerprint,
+        )
+    )
+    session.flush()
+    reconciliation = session.scalar(
+        select(ReconciliationSession).where(
+            ReconciliationSession.plan_id == plan_id,
+            ReconciliationSession.id == reconciliation_id,
+        )
+    )
+    if reconciliation is None:
+        raise RuntimeError("created ReconciliationSession could not be loaded")
+    return CreationResult(reconciliation, True)
+
+
+def list_reconciliations(
+    session: Session, plan_id: UUID, account_id: UUID
+) -> list[ReconciliationSession]:
+    _get_plan(session, plan_id)
+    account = session.scalar(
+        select(Account).where(Account.plan_id == plan_id, Account.id == account_id)
+    )
+    if account is None:
+        raise ResourceNotFound("Account not found")
+    return list(
+        session.scalars(
+            select(ReconciliationSession)
+            .where(
+                ReconciliationSession.plan_id == plan_id,
+                ReconciliationSession.account_id == account_id,
+            )
+            .order_by(
+                ReconciliationSession.statement_date.desc(),
+                ReconciliationSession.created_at.desc(),
+                ReconciliationSession.id,
+            )
+        )
+    )
+
+
+def get_reconciliation(
+    session: Session, plan_id: UUID, account_id: UUID, reconciliation_id: UUID
+) -> ReconciliationSession:
+    _get_plan(session, plan_id)
+    session_obj = session.scalar(
+        select(ReconciliationSession).where(
+            ReconciliationSession.plan_id == plan_id,
+            ReconciliationSession.account_id == account_id,
+            ReconciliationSession.id == reconciliation_id,
+        )
+    )
+    if session_obj is None:
+        raise ResourceNotFound("Reconciliation session not found")
+    return session_obj

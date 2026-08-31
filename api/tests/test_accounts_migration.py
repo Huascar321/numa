@@ -78,7 +78,10 @@ def test_clean_postgresql_18_database_reaches_accounts_head(
 
         config = _alembic_config(database_url)
         scripts = ScriptDirectory.from_config(config)
-        assert scripts.get_revision(EXPECTED_REVISION).down_revision == "004_transfers"
+        assert (
+            scripts.get_revision(EXPECTED_REVISION).down_revision
+            == "013_automation_suggestions"
+        )
 
         command.upgrade(config, "head")
 
@@ -98,6 +101,19 @@ def test_clean_postgresql_18_database_reaches_accounts_head(
             "monthly_budget_assignments",
             "transfers",
             "transfer_legs",
+            "reconciliation_sessions",
+            "watcher_sources",
+            "watcher_raw_messages",
+            "watcher_candidates",
+            "watcher_account_mappings",
+            "rules",
+            "statement_imports",
+            "statement_rows",
+            "transaction_matches",
+            "ai_configurations",
+            "ai_suggestions",
+            "automation_rule_suggestions",
+            "exchange_rate_quotes",
         } <= set(
             database_inspector.get_table_names()
         )

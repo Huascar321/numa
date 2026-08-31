@@ -200,3 +200,102 @@ select {
   color: #9a3412;
   font-weight: 600;
 }
+
+.status-exact {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.status-high {
+  background: #e0f2fe;
+  color: #0369a1;
+}
+
+.status-possible {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.status-new {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.match-comparison {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  background: #f8fafc;
+  padding: 0.75rem;
+  border-radius: 0.5rem;
+  margin: 0.5rem 0;
+}
+
+.match-comparison h5 {
+  margin: 0 0 0.5rem 0;
+  color: #334155;
+}
+
+.match-signals {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+  color: #475569;
+}
+
+.match-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+.freshness-fresh {
+  background: #dcfce7;
+  color: #166534;
+  font-weight: 600;
+  padding: 0.2rem 0.5rem;
+  border-radius: 0.3rem;
+  font-size: 0.8rem;
+}
+
+.freshness-stale {
+  background: #fef3c7;
+  color: #92400e;
+  font-weight: 600;
+  padding: 0.2rem 0.5rem;
+  border-radius: 0.3rem;
+  font-size: 0.8rem;
+}
+
+.fx-quote-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 1rem;
+  margin: 1rem 0;
+}
+
+.fx-provider-badge {
+  display: inline-block;
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.35rem;
+  font-size: 0.8rem;
+  margin-left: 0.5rem;
+}
+
+.fx-formula-banner {
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+  margin: 1rem 0;
+  font-size: 0.9rem;
+}
+
+.fx-calc-result {
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  border-radius: 0.5rem;
+  padding: 1rem;
+  margin-top: 1rem;
+}
