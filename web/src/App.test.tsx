@@ -248,6 +248,9 @@ function createLedgerServer(options: { deferReconciliationPreviews?: boolean } =
     if (path === `/plans/${planId}/categories` && method === "GET") return jsonResponse(categories);
     if (path === `/plans/${planId}/category-groups` && method === "GET") return jsonResponse(groups);
     if (path === `/plans/${planId}/tags` && method === "GET") return jsonResponse(tags);
+    if (path === `/plans/${planId}/gmail`) return jsonResponse({configured:false,configured_senders:[],sources:[]});
+    if (path.includes("binance-card-reviews")) return jsonResponse({candidate_count:0,needs_review_count:0,items:[],next_after:null});
+
 
     const reconciliationHistory = path.match(new RegExp(`^/plans/${planId}/accounts/([^/]+)/reconciliations$`));
     if (reconciliationHistory && method === "GET") {
@@ -431,6 +434,10 @@ function createLedgerServer(options: { deferReconciliationPreviews?: boolean } =
         categories: [{ plan_id: planId, category_id: categoryId, month: summaryPath[1], currency: "BOB", assigned: assigned.toFixed(2), activity: amount, available: (assigned + Number(amount)).toFixed(2), unconverted_by_currency: [{ currency: "USDT", income: "0.000000", expense: "-1.000000", amount: "-1.000000", movement_ids: ["movement-usdt"], transaction_ids: ["transaction-usdt"] }] }],
       });
     }
+    if (path.includes("/budget-actions/") && method === "PUT") {
+      assignments.push({category_id:body.category_id,amount:body.amount});
+      return jsonResponse({},201);
+    }
     const assignmentPut = path.match(new RegExp(`^/plans/${planId}/budget-assignments/([^/]+)$`));
     if (assignmentPut && method === "PUT") {
       const assignment = { id: assignmentPut[1], plan_id: planId, category_id: body.category_id, month_key: body.month, amount: body.amount, currency_code: "BOB", source: "manual", provenance: {}, created_at: timestamp };
@@ -464,6 +471,152 @@ afterEach(() => {
 });
 
 describe("minimal authoritative client flows", () => {
+  it("renders the shared Numa brand and home navigation", async () => {
+    const server = createServer();
+    vi.stubGlobal("fetch", server.fetchMock);
+    renderApp("/plans");
+    expect(screen.getByRole("link", { name: "Numa home" })).toHaveAttribute("href", "/plans");
+    expect(screen.getByText("Personal finance")).toBeInTheDocument();
+    expect(await screen.findByText("No Plans yet.")).toBeInTheDocument();
+  });
+
+  it("opens activity directly and keeps disclosed evidence in the exact transaction request", async () => {
+    const server = createLedgerServer();
+    renderApp("/plans/plan-ledger/ledger");
+    await screen.findAllByRole("option", { name: /Main account/ });
+    expect(screen.queryByRole("region", { name: "Budget month" })).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Transactions" })).toBeInTheDocument();
+    expect(within(screen.getByRole("navigation", {name:"Workspace navigation"})).getByRole("link", {name:"All activity"})).toHaveAttribute("aria-current","page");
+    expect(screen.getByRole("link", { name: "Activity" })).toHaveAttribute("href", "#transactions-heading");
+    fireEvent.click(screen.getByRole("button", {name:"+ Add transaction"}));
+    fireEvent.change(screen.getByLabelText("Transaction account"), {target:{value:"account-ledger"}});
+    const evidence = screen.getByText("Additional evidence").closest("details");
+    expect(evidence).not.toHaveAttribute("open");
+    fireEvent.click(screen.getByText("Additional evidence"));
+    expect(evidence).toHaveAttribute("open");
+    fireEvent.change(screen.getByLabelText("Outflow"), { target: { value: "12.00" } });
+    fireEvent.change(screen.getByLabelText("Photo reference (opaque)"), { target: { value: "receipt-reference" } });
+    fireEvent.change(screen.getByLabelText("Location JSON"), { target: { value: '{"city":"La Paz"}' } });
+    fireEvent.change(screen.getByLabelText("Source metadata JSON"), { target: { value: '{"provider":"manual"}' } });
+    fireEvent.change(screen.getByLabelText("Provenance JSON"), { target: { value: '{"note":"user entered"}' } });
+    // Disclosure never unmounts or resets the user's draft.
+    fireEvent.click(screen.getByText("Additional evidence"));
+    fireEvent.click(screen.getByText("Additional evidence"));
+    expect(screen.getByLabelText("Photo reference (opaque)")).toHaveValue("receipt-reference");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText("Transaction added. Balances and budget have been refreshed.")).toBeInTheDocument();
+    const request = server.fetchMock.mock.calls.find(([path, init]) => String(path).includes("/transactions/") && init?.method === "PUT");
+    expect(JSON.parse(String(request?.[1]?.body))).toMatchObject({
+      amount: "12.00", currency_code: "BOB", photo_reference: "receipt-reference",
+      location: { city: "La Paz" }, source_metadata: { provider: "manual" }, provenance: { note: "user entered" },
+    });
+  });
+
+  it("keeps invalid advanced JSON from submitting financial activity", async () => {
+    const server = createLedgerServer();
+    renderApp("/plans/plan-ledger/ledger");
+    await screen.findAllByRole("option", { name: /Main account/ });
+    fireEvent.click(screen.getByRole("button", {name:"+ Add transaction"}));
+    fireEvent.change(screen.getByLabelText("Transaction account"), {target:{value:"account-ledger"}});
+    fireEvent.click(screen.getByText("Additional evidence"));
+    fireEvent.change(screen.getByLabelText("Outflow"), { target: { value: "12.00" } });
+    fireEvent.change(screen.getByLabelText("Provenance JSON"), { target: { value: "not json" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Provenance must be valid JSON.");
+    expect(server.fetchMock.mock.calls.some(([, init]) => init?.method === "PUT")).toBe(false);
+  });
+
+  it("inherits the register account, saves the local date and suggests the last category for a payee", async () => {
+    const server = createLedgerServer();
+    const local = new Date(2026, 10, 22, 23, 55);
+    vi.useFakeTimers({toFake: ["Date"]});
+    vi.setSystemTime(local);
+    try {
+      renderApp("/plans/plan-ledger/ledger?account=account-usdt");
+      await screen.findAllByRole("option", {name: /USDT wallet/});
+      fireEvent.click(screen.getByRole("button", {name: "+ Add transaction"}));
+      const entry = within(await screen.findByRole("form", {name:"Transaction entry"}));
+      expect(entry.getByLabelText("Transaction account")).toHaveValue("account-usdt");
+      expect(entry.getByLabelText("Date and time")).toHaveValue("2026-11-22T23:55");
+      fireEvent.change(entry.getByLabelText("Payee"), {target:{value:"Cafe"}});
+      fireEvent.click(entry.getByRole("button", {name:"Category: Pendientes"}));
+      fireEvent.change(entry.getByLabelText("Search categories"), {target:{value:"ocer"}});
+      fireEvent.click(entry.getByRole("button", {name:"Groceries"}));
+      fireEvent.change(entry.getByLabelText("Outflow"), {target:{value:"12,34"}});
+      fireEvent.click(entry.getByRole("button", {name:"Save and add another"}));
+      await entry.findByText("Transaction saved.");
+      const writes = () => server.fetchMock.mock.calls.filter(([path,init]) => String(path).includes("/transactions/") && init?.method==="PUT");
+      expect(JSON.parse(String(writes()[0][1]?.body))).toMatchObject({amount:"12.34",account_id:"account-usdt",category_id:"category-groceries",event_at:local.toISOString()});
+      expect(entry.getByLabelText("Outflow")).toHaveValue("");
+      expect(entry.getByLabelText("Transaction account")).toHaveValue("account-usdt");
+      fireEvent.change(entry.getByLabelText("Payee"), {target:{value:" CAFE "}});
+      expect(entry.getByRole("button", {name:"Category: Groceries"})).toBeInTheDocument();
+      fireEvent.click(entry.getByRole("button", {name:"Category: Groceries"}));
+      fireEvent.click(entry.getByRole("button", {name:"Pendientes"}));
+      fireEvent.change(entry.getByLabelText("Payee"), {target:{value:"Cafe"}});
+      expect(entry.getByRole("button", {name:"Category: Pendientes"})).toBeInTheDocument();
+      fireEvent.click(entry.getByRole("button", {name:"Cancel"}));
+      expect(writes()).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("offers recent alternatives for the same payee and keeps an explicit category", async () => {
+    const server = createLedgerServer();
+    const path = "/plans/plan-ledger";
+    const put = (resource: string, data: object) =>
+      server.fetchMock(path + resource, {method: "PUT", body: JSON.stringify(data)});
+    await put("/categories/transport", {name: "Transport"});
+    // The real ledger returns effective transactions newest first.
+    for (const [day, category] of [["03", "category-groceries"], ["02", "transport"], ["01", "transport"]]) {
+      await put("/transactions/demo-" + day, {
+        type: "expense", amount: "10.00", currency_code: "BOB", account_id: "account-ledger",
+        event_at: "2026-11-" + day + "T12:00:00Z", category_id: category, merchant: "Local shop",
+      });
+    }
+    renderApp(path + "/ledger?account=account-ledger");
+    await screen.findAllByRole("option", {name: /Main account/});
+    fireEvent.click(screen.getByRole("button", {name: "+ Add transaction"}));
+    const entry = within(await screen.findByRole("form", {name: "Transaction entry"}));
+    fireEvent.change(entry.getByLabelText("Payee"), {target: {value: "local shop"}});
+    fireEvent.click(await entry.findByRole("button", {name: "Category: Groceries"}));
+    const recents = within(entry.getByRole("group", {name: "Recent categories for this payee"}));
+    expect(recents.getAllByRole("button")).toHaveLength(1);
+    fireEvent.click(recents.getByRole("button", {name: "Transport"}));
+    fireEvent.change(entry.getByLabelText("Outflow"), {target: {value: "8.00"}});
+    fireEvent.click(entry.getByRole("button", {name: "Save"}));
+    await screen.findByText("Transaction added. Balances and budget have been refreshed.");
+    const writes = server.fetchMock.mock.calls.filter(([url, init]) => String(url).includes("/transactions/") && init?.method === "PUT");
+    expect(JSON.parse(String(writes[writes.length - 1]?.[1]?.body)).category_id).toBe("transport");
+  });
+
+  it("requires an account in All activity and reuses the transaction ID after a lost response", async () => {
+    const server = createLedgerServer();
+    const ids: string[] = [];
+    vi.stubGlobal("fetch", async (path: RequestInfo | URL, init?: RequestInit) => {
+      const result = await server.fetchMock(path, init);
+      if (init?.method === "PUT" && String(path).includes("/transactions/")) {
+        ids.push(String(path));
+        if (ids.length === 1) throw new TypeError("Response lost");
+      }
+      return result;
+    });
+    renderApp("/plans/plan-ledger/ledger");
+    await screen.findAllByRole("option", {name:/Main account/});
+    fireEvent.click(screen.getByRole("button", {name:"+ Add transaction"}));
+    const entry = within(await screen.findByRole("form", {name:"Transaction entry"}));
+    expect(entry.getByRole("button", {name:"Save"})).toBeDisabled();
+    fireEvent.change(entry.getByLabelText("Transaction account"), {target:{value:"account-ledger"}});
+    fireEvent.change(entry.getByLabelText("Outflow"), {target:{value:"15.00"}});
+    fireEvent.click(entry.getByRole("button", {name:"Save"}));
+    expect(await entry.findByRole("alert")).toHaveTextContent("Response lost");
+    fireEvent.click(entry.getByRole("button", {name:"Save"}));
+    await screen.findByText("Transaction added. Balances and budget have been refreshed.");
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).toBe(ids[1]);
+  });
+
   it("creates and selects a Plan using server responses", async () => {
     createServer();
     renderApp("/plans");
@@ -518,23 +671,24 @@ describe("minimal authoritative client flows", () => {
     server.seedPlan(plan);
     renderApp(`/plans/${planId}/accounts`);
 
-    expect(await screen.findByRole("heading", { name: "Accounts" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Accounts", level: 1 })).toBeInTheDocument();
+    const accountList=within(screen.getByRole("region",{name:"Accounts"}));
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "USDT wallet" } });
     fireEvent.change(screen.getByLabelText("Type"), { target: { value: "Crypto" } });
     fireEvent.change(screen.getByLabelText("Currency"), { target: { value: "USDT" } });
     fireEvent.click(screen.getByRole("button", { name: "Create Account" }));
 
-    expect(await screen.findByText("USDT wallet")).toBeInTheDocument();
-    expect(screen.getByText("0.000000 USDT")).toBeInTheDocument();
-    const accountCard = () => screen.getByText(/USDT wallet|Renamed wallet/).closest("article") as HTMLElement;
+    expect(await accountList.findByText("USDT wallet")).toBeInTheDocument();
+    expect(accountList.getByText("0,000000 USDT")).toBeInTheDocument();
+    const accountCard = () => accountList.getByText(/USDT wallet|Renamed wallet/).closest("article") as HTMLElement;
 
     fireEvent.click(within(accountCard()).getByRole("button", { name: "Rename" }));
     fireEvent.change(screen.getByLabelText("New name"), { target: { value: "Renamed wallet" } });
     fireEvent.click(within(accountCard()).getByRole("button", { name: "Save" }));
-    expect(await screen.findByText("Renamed wallet")).toBeInTheDocument();
+    expect(await accountList.findByText("Renamed wallet")).toBeInTheDocument();
 
     fireEvent.click(within(accountCard()).getByRole("button", { name: "Archive" }));
-    const archivedCard = await screen.findByText("Renamed wallet");
+    const archivedCard = await accountList.findByText("Renamed wallet");
     const archivedArticle = archivedCard.closest("article") as HTMLElement;
     await waitFor(() => expect(within(archivedArticle).getByText("archived"))
       .toBeInTheDocument());
@@ -552,7 +706,7 @@ describe("minimal authoritative client flows", () => {
     createLedgerServer();
     renderApp("/plans/plan-ledger/ledger");
 
-    expect(await screen.findByRole("heading", { name: "Ledger" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "All activity" })).toBeInTheDocument();
     const pendingLabel = await screen.findByText("Pendientes", { selector: "strong" });
     const pending = pendingLabel.closest(".taxonomy-item") as HTMLElement;
     expect(within(pending).queryByRole("button", { name: "Rename" })).not.toBeInTheDocument();
@@ -570,7 +724,7 @@ describe("minimal authoritative client flows", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add Tag" }));
     expect(await screen.findByText("Travel")).toBeInTheDocument();
 
-    const groceries = screen.getAllByText("Groceries", { selector: "strong" })[0]
+    const groceries = within(screen.getByRole("region", { name: "Categories and Tags" })).getByText("Groceries", { selector: "strong" })
       .closest(".taxonomy-item") as HTMLElement;
     fireEvent.click(within(groceries).getByRole("button", { name: "Archive" }));
     await waitFor(() => expect(within(groceries).getByText("archived")).toBeInTheDocument());
@@ -580,33 +734,83 @@ describe("minimal authoritative client flows", () => {
     const server = createLedgerServer();
     renderApp("/plans/plan-ledger/ledger");
 
-    expect(await screen.findByRole("heading", { name: "Ledger" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "All activity" })).toBeInTheDocument();
     expect((await screen.findAllByRole("option", { name: /Main account/ })).length).toBeGreaterThan(0);
-    fireEvent.change(screen.getByLabelText("Amount (exact decimal string)"), {
+    fireEvent.click(screen.getByRole("button", {name:"+ Add transaction"}));
+    fireEvent.change(screen.getByLabelText("Transaction account"), {target:{value:"account-ledger"}});
+    fireEvent.change(screen.getByLabelText("Outflow"), {
       target: { value: "12.00" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Post" }));
-    expect(await screen.findByText((text) => text.includes("expense 12.00 BOB"))).toBeInTheDocument();
-    expect(await screen.findByText((text) => text.includes("-12.00 BOB"))).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const register = () => screen.getByRole("region", { name: "Transaction register" });
+    expect(await within(register()).findByText("Bs 12,00")).toBeInTheDocument();
+    expect(within(screen.getByRole("complementary",{name:"Budget accounts"})).getByRole("link",{name:/Main account/})).toHaveTextContent("-Bs 12,00");
 
-    fireEvent.click(screen.getByRole("button", { name: "View detail and correct" }));
+    fireEvent.click(within(register()).getByRole("button", { name: /^Edit / }));
     const correctionInput = await screen.findByLabelText("Replacement amount");
     fireEvent.change(correctionInput, { target: { value: "15.00" } });
     fireEvent.click(screen.getByRole("button", { name: "Save correction" }));
-    expect(await screen.findByText((text) => text.includes("expense 15.00 BOB"))).toBeInTheDocument();
-    expect(await screen.findByText((text) => text.includes("-15.00 BOB"))).toBeInTheDocument();
+    expect(await within(register()).findByText("Bs 15,00")).toBeInTheDocument();
+    expect(within(screen.getByRole("complementary",{name:"Budget accounts"})).getByRole("link",{name:/Main account/})).toHaveTextContent("-Bs 15,00");
     expect(await screen.findByText("#1: 12.00 → 15.00")).toBeInTheDocument();
 
-    const assignmentCategory = screen.getAllByLabelText("Category").at(-1);
-    expect(assignmentCategory).toBeDefined();
-    fireEvent.change(assignmentCategory as HTMLSelectElement, { target: { value: "category-groceries" } });
-    fireEvent.change(screen.getByLabelText("Assignment (exact decimal string)"), {
-      target: { value: "20.00" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Assign" }));
-    expect(await screen.findByText(/Assigned 20\.00/)).toBeInTheDocument();
-    expect(screen.getAllByText(/Unconverted USDT: -1\.000000/).length).toBeGreaterThan(0);
+    fireEvent.click(within(screen.getByRole("navigation",{name:"Workspace navigation"})).getByRole("link",{name:"Budget"}));
+    fireEvent.click(await screen.findByRole("button",{name:"View Groceries details"}));
+    fireEvent.change(screen.getByLabelText("Assigned this month"), {target:{value:"20.00"}});
+    fireEvent.click(screen.getByRole("button",{name:"Save assigned amount"}));
+    await screen.findByText("Budget updated.");
+    expect(screen.getByRole("button",{name:"Assign money to Groceries"})).toHaveTextContent("20,00");
+    expect(screen.getAllByText(/Unconverted USDT: -1,000000/).length).toBeGreaterThan(0);
     expect(server.fetchMock.mock.calls.some(([path]) => String(path).includes("/budget/months/"))).toBe(true);
+  });
+
+  it("filters the register and submits a full correction payload", async () => {
+    const server = createLedgerServer();
+    renderApp("/plans/plan-ledger/ledger");
+
+    await screen.findByRole("heading", { name: "All activity" });
+    await screen.findAllByRole("option", { name: /Main account/ });
+    const register = () => screen.getByRole("region", { name: "Transaction register" });
+
+    fireEvent.click(screen.getByRole("button", {name:"+ Add transaction"}));
+    fireEvent.change(screen.getByLabelText("Transaction account"), {target:{value:"account-ledger"}});
+    fireEvent.change(screen.getByLabelText("Outflow"), { target: { value: "12.00" } });
+    fireEvent.change(screen.getByLabelText("Payee"), { target: { value: "Cafe" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Transaction added. Balances and budget have been refreshed.");
+
+    fireEvent.click(screen.getByRole("button", {name:"+ Add transaction"}));
+    fireEvent.change(screen.getByLabelText("Transaction account"), {target:{value:"account-ledger"}});
+    fireEvent.change(screen.getByLabelText("Outflow"), { target: { value: "20.00" } });
+    fireEvent.change(screen.getByLabelText("Payee"), { target: { value: "Rent" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(within(register()).getAllByRole("button", { name: /^Edit / })).toHaveLength(2));
+
+    fireEvent.change(screen.getByLabelText("Search"), { target: { value: "Cafe" } });
+    expect(within(register()).getByText("Cafe")).toBeInTheDocument();
+    expect(within(register()).queryByText("Rent")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Search"), { target: { value: "" } });
+    fireEvent.change(within(register()).getByLabelText("Account"), { target: { value: "account-usdt" } });
+    expect(await screen.findByText("No transactions match this view.")).toBeInTheDocument();
+
+    fireEvent.change(within(register()).getByLabelText("Account"), { target: { value: "" } });
+    fireEvent.click(within(register()).getAllByRole("button", { name: /^Edit / })[0]);
+    fireEvent.change(screen.getByLabelText("Replacement amount"), { target: { value: "15.00" } });
+    fireEvent.change(screen.getByLabelText("Correction merchant"), { target: { value: "Cafe Updated" } });
+    fireEvent.change(screen.getByLabelText("Correction memo"), { target: { value: "Latte" } });
+    fireEvent.change(screen.getByLabelText("Correction category"), { target: { value: "category-groceries" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save correction" }));
+    expect(await screen.findByText("Correction saved. The original entry remains in the audit history.")).toBeInTheDocument();
+
+    const correctionCall = server.fetchMock.mock.calls.find(([path, init]) =>
+      String(path).includes("/corrections/") && init?.method === "PUT");
+    expect(JSON.parse(String(correctionCall?.[1]?.body))).toMatchObject({
+      amount: "15.00",
+      merchant: "Cafe Updated",
+      memo: "Latte",
+      category_id: "category-groceries",
+    });
   });
 
   it("posts an exact cross-currency Transfer, renders grouped facts, and refetches after reversal", async () => {
@@ -619,10 +823,10 @@ describe("minimal authoritative client flows", () => {
     fireEvent.change(screen.getByLabelText("Rate source evidence"), { target: { value: "bank receipt" } });
     fireEvent.click(screen.getByRole("button", { name: "Create Transfer" }));
 
-    expect(await screen.findByText(/Transfer 99999999999999999999\.99 BOB/)).toBeInTheDocument();
+    expect(await screen.findByText(/Transfer Bs 99(?:\.999){6},99/)).toBeInTheDocument();
     expect(screen.getByText(/Event 2026-/)).toBeInTheDocument();
     expect(screen.getByText(/outbound leg leg-out, transaction transaction-out/)).toBeInTheDocument();
-    const transferCard = screen.getByText(/Transfer 99999999999999999999\.99 BOB/).closest("article") as HTMLElement;
+    const transferCard = screen.getByText(/Transfer Bs 99(?:\.999){6},99/).closest("article") as HTMLElement;
     expect(within(transferCard).queryByRole("button", { name: /correct|delete|unlink|edit/i })).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Reversal reason"), { target: { value: "duplicate" } });
@@ -639,7 +843,7 @@ describe("minimal authoritative client flows", () => {
     await waitFor(() => expect(screen.getByLabelText("Reconciliation Account")).toHaveValue("account-ledger"));
     fireEvent.change(balance, { target: { value: "5.00" } });
     fireEvent.click(screen.getByRole("button", { name: "Preview reconciliation" }));
-    expect(await screen.findByText("Discrepancy 5.00 BOB")).toBeInTheDocument();
+    expect(await screen.findByText("Discrepancy Bs 5,00")).toBeInTheDocument();
     const confirm = screen.getByRole("button", { name: "Confirm reconciliation" });
     expect(confirm).toBeDisabled();
     fireEvent.click(screen.getByLabelText("I explicitly accept this discrepancy warning."));
@@ -649,7 +853,7 @@ describe("minimal authoritative client flows", () => {
     await waitFor(() => expect(server.fetchMock.mock.calls.filter(([path]) => String(path).includes("/accounts")).length).toBeGreaterThan(2));
 
     fireEvent.click(screen.getByRole("button", { name: "Preview reconciliation" }));
-    expect(await screen.findByText("Discrepancy 0.00 BOB")).toBeInTheDocument();
+    expect(await screen.findByText("Discrepancy Bs 0,00")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Confirm reconciliation" }));
     expect(await screen.findByText("Confirmed without adjustment")).toBeInTheDocument();
   });
@@ -674,14 +878,14 @@ describe("minimal authoritative client flows", () => {
       "account-usdt",
     ]);
     await act(async () => { server.pendingReconciliationPreviews[1].release(); });
-    expect(await screen.findByText("Discrepancy 7.000000 USDT")).toBeInTheDocument();
+    expect(await screen.findByText("Discrepancy 7,000000 USDT")).toBeInTheDocument();
 
     await act(async () => {
       server.pendingReconciliationPreviews[0].release();
       await Promise.resolve();
     });
-    expect(screen.getByText("Discrepancy 7.000000 USDT")).toBeInTheDocument();
-    expect(screen.queryByText("Discrepancy 5.00 BOB")).not.toBeInTheDocument();
+    expect(screen.getByText("Discrepancy 7,000000 USDT")).toBeInTheDocument();
+    expect(screen.queryByText("Discrepancy Bs 5,00")).not.toBeInTheDocument();
   });
 
   it("confirms exactly the immutable request snapshot represented by the preview", async () => {
@@ -696,8 +900,8 @@ describe("minimal authoritative client flows", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Preview reconciliation" }));
 
-    expect(await screen.findByText("Discrepancy 5.00 BOB")).toBeInTheDocument();
-    expect(screen.getByText("Policy warn · tolerance 0.00 BOB")).toBeInTheDocument();
+    expect(await screen.findByText("Discrepancy Bs 5,00")).toBeInTheDocument();
+    expect(screen.getByText("Policy warn · tolerance Bs 0,00")).toBeInTheDocument();
     fireEvent.click(screen.getByLabelText("I explicitly accept this discrepancy warning."));
     fireEvent.click(screen.getByRole("button", { name: "Confirm reconciliation" }));
     await screen.findByText(/Adjustment adjustment-/);
@@ -716,4 +920,35 @@ describe("minimal authoritative client flows", () => {
       warning_accepted: true,
     });
   });
+});
+
+
+it("keeps one persistent workspace sidebar across Budget, activity, Accounts and Gmail",async()=>{
+  createLedgerServer();
+  renderApp("/plans/plan-ledger/budget");
+  await screen.findByRole("button",{name:"View Groceries details"});
+  const sidebar=screen.getByRole("complementary",{name:"Budget accounts"});
+  for (const [destination,heading] of [["All activity","All activity"],["Accounts","Accounts"],["Gmail","Gmail"]]) {
+    fireEvent.click(within(screen.getByRole("navigation",{name:"Workspace navigation"})).getByRole("link",{name:destination}));
+    await screen.findByRole("heading",{name:heading,level:1});
+    expect(screen.getByRole("complementary",{name:"Budget accounts"})).toBe(sidebar);
+    expect(screen.getAllByRole("navigation",{name:"Workspace navigation"})).toHaveLength(1);
+    expect(screen.queryByRole("navigation",{name:"Plan navigation"})).not.toBeInTheDocument();
+    expect(within(sidebar).getByRole("link",{name:destination})).toHaveAttribute("aria-current","page");
+  }
+  fireEvent.click(within(sidebar).getByRole("link",{name:"Budget"}));
+  await screen.findByRole("button",{name:"View Groceries details"});
+  expect(screen.getByRole("complementary",{name:"Budget accounts"})).toBe(sidebar);
+});
+
+it("keeps workspace navigation available when Budget content fails",async()=>{
+  const server=createLedgerServer();
+  vi.stubGlobal("fetch",(input:RequestInfo|URL,init?:RequestInit)=>String(input).endsWith("/categories")
+    ? Promise.resolve(jsonResponse({detail:"Unavailable"},503)) : server.fetchMock(input,init));
+  renderApp("/plans/plan-ledger/budget");
+  await screen.findByText("The budget workspace could not be loaded.");
+  const sidebar=screen.getByRole("complementary",{name:"Budget accounts"});
+  fireEvent.click(within(screen.getByRole("navigation",{name:"Workspace navigation"})).getByRole("link",{name:"Gmail"}));
+  await screen.findByRole("heading",{name:"Gmail",level:1});
+  expect(screen.getByRole("complementary",{name:"Budget accounts"})).toBe(sidebar);
 });

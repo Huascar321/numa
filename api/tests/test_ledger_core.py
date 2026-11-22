@@ -922,7 +922,7 @@ def test_month_boundaries_assignments_dst_and_unconverted_reporting(client: Test
     february = client.get(f"/plans/{plan_id}/budget/months/2026-02").json()
     march = client.get(f"/plans/{plan_id}/budget/months/2026-03").json()
     assert february["ready_to_assign"] == "50.00"
-    assert march["ready_to_assign"] == "0.00"
+    assert march["ready_to_assign"] == "50.00"
     assert february["unconverted_by_currency"] == []
     assert march["unconverted_by_currency"][0]["currency"] == "USDT"
     assert march["unconverted_by_currency"][0]["amount"] == "-1.000000"
@@ -993,19 +993,21 @@ def test_budget_rollover_overspending_card_and_goals(client: TestClient) -> None
     march = client.get(f"/plans/{plan_id}/budget/months/2026-03").json()
     february_categories = {item["category_id"]: item for item in february["categories"]}
     march_categories = {item["category_id"]: item for item in march["categories"]}
-    assert february_categories[cash_category]["available"] == "0.00"
+    assert february_categories[cash_category]["available"] == "-50.00"
     assert february_categories[cash_category]["cash_overspending"] == "50.00"
     assert february_categories[card_category]["credit_card_overspending"] == "50.00"
-    assert march["ready_to_assign"] == "-50.00"
+    assert march["ready_to_assign"] == "-415.00"
     assert march_categories[rollover_category]["rollover"] == "40.00"
     assert client.get(f"/plans/{plan_id}/accounts/{card}/balance").json()["amount"] == "-150.00"
     assert february_categories[target_category]["goal"]["status"] == "completed"
     assert february_categories[target_category]["goal"]["required_contribution"] == "0.00"
+    assert february_categories[target_category]["goal"]["progress"] == 100
     assert february_categories[monthly_category]["goal"]["status"] == "funded"
-    assert february_categories[monthly_category]["goal"]["required_contribution"] == "25.00"
+    assert february_categories[monthly_category]["goal"]["required_contribution"] == "0.00"
+    assert february_categories[monthly_category]["goal"]["progress"] == 100
     assert february_categories[due_category]["goal"] == {
         "type": "due_date", "target": "100.00", "due_month": "2026-03",
-        "required_contribution": "25.00", "status": "on_track",
+        "required_contribution": "0.00", "progress": 50, "status": "on_track",
     }
 
 
@@ -1073,5 +1075,5 @@ def test_due_date_goal_uses_displayed_minor_unit_contribution(client: TestClient
     goal = client.get(
         f"/plans/{plan_id}/budget/months/2026-01/categories/{category_id}"
     ).json()["goal"]
-    assert goal["required_contribution"] == "22.22"
-    assert goal["status"] == "on_track"
+    assert goal["required_contribution"] == "7.41"
+    assert goal["status"] == "underfunded"

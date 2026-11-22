@@ -1,0 +1,105 @@
+.plan-navigation {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  margin-bottom: 2rem;
+  padding-block: 0.5rem;
+  background: rgb(243 240 232 / 96%);
+  backdrop-filter: blur(16px);
+}
+
+.plan-navigation::after {
+  position: absolute;
+  right: 0;
+  bottom: -0.75rem;
+  left: 0;
+  height: 0.75rem;
+  background: linear-gradient(to bottom, rgb(243 240 232 / 90%), transparent);
+  pointer-events: none;
+  content: "";
+}
+
+.plan-navigation-link {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.75rem;
+  min-width: 0;
+  padding: 0.5rem 0.75rem;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  text-decoration: none;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.plan-navigation-link[aria-current="page"] { color: var(--ink); font-weight: 600; }
+.plan-navigation-link[aria-current="page"]::after {
+  position: absolute;
+  right: 0.75rem;
+  bottom: 0;
+  left: 0.75rem;
+  height: 2px;
+  background: var(--accent);
+  content: "";
+}
+
+.plan-navigation-link:active { background: #e8e1d5; }
+
+.section-navigation {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  margin-block: -1rem 2rem;
+}
+
+.section-navigation-caption {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.section-navigation a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+  font-size: 0.85rem;
+}
+
+.page:has(.plan-navigation) [id] { scroll-margin-top: 6rem; }
+
+@media (max-width: 600px) {
+  .plan-navigation {
+    position: fixed;
+    top: auto;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    justify-content: space-around;
+    gap: 0.25rem;
+    margin: 0;
+    padding: 0.65rem 1rem calc(0.65rem + env(safe-area-inset-bottom, 0px));
+    border-top: 1px solid var(--line);
+  }
+  .plan-navigation::after { display: none; }
+  .plan-navigation-link { flex: 1; }
+  .page:has(.plan-navigation) { padding-bottom: calc(7rem + env(safe-area-inset-bottom, 0px)); }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .plan-navigation { background: var(--paper); backdrop-filter: none; }
+  .plan-navigation::after { display: none; }
+}
+
+@media (prefers-contrast: more) {
+  .plan-navigation { background: var(--paper); backdrop-filter: none; border-block: 1px solid var(--ink); }
+  .plan-navigation-link { color: var(--ink); }
+}

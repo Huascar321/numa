@@ -1,0 +1,23 @@
+name: numa-dev-postgres-18
+
+services:
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: numa_dev
+      POSTGRES_USER: numa_dev
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.numa-dev}
+      POSTGRES_INITDB_ARGS: --auth-local=scram-sha-256 --auth-host=scram-sha-256
+    ports:
+      - "127.0.0.1:${NUMA_DEV_POSTGRES_PORT:-39747}:5432"
+    volumes:
+      - numa-dev-postgres-18-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  numa-dev-postgres-18-data:

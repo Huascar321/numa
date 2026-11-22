@@ -20,6 +20,7 @@ def test_optional_provider_configuration_can_be_absent(monkeypatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
     settings = Settings(
+        _env_file=None,
         database_url="postgresql+psycopg://numa:example@localhost:5432/numa",
     )
 
@@ -32,6 +33,19 @@ def test_optional_provider_configuration_can_be_absent(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
+
+def test_gmail_sender_scope_defaults_normalization_and_environment(monkeypatch) -> None:
+    monkeypatch.delenv("GMAIL_ALLOWED_SENDERS", raising=False)
+    assert Settings(_env_file=None).gmail_allowed_senders == []
+    monkeypatch.setenv("GMAIL_ALLOWED_SENDERS", '["Notice@EXAMPLE.com"," notice@example.com "]')
+    assert Settings(_env_file=None).gmail_allowed_senders == ["notice@example.com"]
+
+
+@pytest.mark.parametrize("sender", ["*", "@example.com", "from:x@example.com", "User <x@example.com>", "a@example.com OR in:anywhere", "a@example.com\n", "a..b@example.com"])
+def test_gmail_sender_scope_rejects_broad_or_invalid_inputs(sender, monkeypatch) -> None:
+    monkeypatch.delenv("GMAIL_ALLOWED_SENDERS", raising=False)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, gmail_allowed_senders=[sender])
 
 def test_worker_construction_does_not_require_optional_providers() -> None:
     first_worker = Worker(

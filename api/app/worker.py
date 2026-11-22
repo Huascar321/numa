@@ -38,6 +38,7 @@ class Worker:
         lease_duration: timedelta,
         retry_delay: timedelta,
         clock: Callable[[], datetime] = utc_now,
+        scheduler: Callable[[], None] | None = None,
     ) -> None:
         self._sessions = sessions
         self._claimant_id = new_worker_claimant_id(claimant_name)
@@ -45,12 +46,15 @@ class Worker:
         self._lease_duration = lease_duration
         self._retry_delay = retry_delay
         self._clock = clock
+        self._scheduler = scheduler
 
     @property
     def claimant_id(self) -> str:
         return self._claimant_id
 
     def run_once(self) -> bool:
+        if self._scheduler is not None:
+            self._scheduler()
         with self._sessions() as session:
             job = claim_next_job(
                 session,
@@ -149,12 +153,21 @@ def new_worker_claimant_id(claimant_name: str) -> str:
 
 
 def main() -> None:
+    from app.gmail.service import handle_job, schedule_due
+    from app.binance_card.service import process_pending
+
     settings = Settings()
     database_url = settings.require_database_url()
+    sessions = session_factory(settings)
+    def schedule() -> None:
+        schedule_due(sessions, settings)
+        process_pending(sessions)
+
     worker = Worker(
-        session_factory(settings),
+        sessions,
         claimant_name="numa-worker",
-        handler=_unconfigured_handler,
+        handler=lambda job: handle_job(sessions, settings, job),
+        scheduler=schedule,
         lease_duration=timedelta(seconds=settings.worker_lease_seconds),
         retry_delay=timedelta(seconds=settings.worker_poll_seconds),
     )

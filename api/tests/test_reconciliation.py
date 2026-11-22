@@ -492,7 +492,7 @@ def test_reconciliation_waits_for_every_current_movement_writer(
 def test_reconciliation_schema_and_revision_contract(migrated_postgres_url: str) -> None:
     engine = session_factory_for(migrated_postgres_url).kw["bind"]
     inspector = inspect(engine)
-    assert EXPECTED_REVISION == "006_reconciliation"
+    assert EXPECTED_REVISION == "010_ynab_budget"
     columns = {item["name"]: item for item in inspector.get_columns("reconciliation_sessions")}
     assert columns["statement_at"]["type"].timezone is True
     for name in ("statement_balance", "derived_balance", "discrepancy", "tolerance"):

@@ -78,7 +78,7 @@ def test_clean_postgresql_18_database_reaches_accounts_head(
 
         config = _alembic_config(database_url)
         scripts = ScriptDirectory.from_config(config)
-        assert scripts.get_revision(EXPECTED_REVISION).down_revision == "005_budget_engine"
+        assert scripts.get_revision(EXPECTED_REVISION).down_revision == "009_watcher_runs"
 
         command.upgrade(config, "head")
 
@@ -337,4 +337,98 @@ def test_upgrade_from_budget_engine_then_repeated_head_and_readiness(
         assert TestClient(
             create_app(Settings(database_url=database_url))
         ).get("/health/ready").status_code == 200
+        engine.dispose()
+
+
+def test_upgrade_from_reconciliation_preserves_existing_plan_and_reaches_gmail(
+    postgres_url: str,
+) -> None:
+    with _temporary_database(postgres_url) as database_url:
+        config = _alembic_config(database_url)
+        command.upgrade(config, "006_reconciliation")
+        client = TestClient(create_app(Settings(database_url=database_url)))
+        plan_id = uuid4()
+        _seed_legacy_plan(database_url, plan_id, "Existing plan")
+        assert client.get("/health/ready").status_code == 503
+        command.upgrade(config, "head")
+        command.upgrade(config, "head")
+        assert _current_revision(database_url) == EXPECTED_REVISION
+        assert client.get("/health/ready").status_code == 200
+        assert client.get(f"/plans/{plan_id}").json()["name"] == "Existing plan"
+        assert client.get(f"/plans/{plan_id}/gmail").json()["sources"] == []
+        engine = create_engine(database_url)
+        assert {"gmail_sources", "gmail_oauth_states", "gmail_messages"} <= set(inspect(engine).get_table_names())
+        engine.dispose()
+
+
+def test_gmail_filter_migration_fences_legacy_connection_without_erasing_evidence(postgres_url):
+    with _temporary_database(postgres_url) as database_url:
+        config = _alembic_config(database_url)
+        command.upgrade(config, "007_gmail")
+        client = TestClient(create_app(Settings(_env_file=None, database_url=database_url)))
+        plan_id, source_id, pending_id = uuid4(), uuid4(), uuid4()
+        _seed_legacy_plan(database_url, plan_id, "Legacy Gmail")
+        engine = create_engine(database_url)
+        with engine.begin() as connection:
+            connection.execute(text("""
+                INSERT INTO gmail_sources
+                    (id, plan_id, email, status, refresh_token_ciphertext,
+                     sync_mode, pending_job_id, next_poll_at)
+                VALUES (:id, :plan, 'me@example.com', 'active', 'encrypted-legacy',
+                        'full', :pending, CURRENT_TIMESTAMP)
+            """), {"id": source_id, "plan": plan_id, "pending": pending_id})
+            connection.execute(text("""
+                INSERT INTO gmail_messages
+                    (source_id, gmail_id, raw_mime, provider_metadata, decoded, status)
+                VALUES (:source, 'legacy', :raw, '{}', '{}', 'decoded')
+            """), {"source": source_id, "raw": b"retained evidence"})
+        command.upgrade(config, "head")
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            row = connection.execute(text("""
+                SELECT status, allowed_senders, pending_job_id, next_poll_at,
+                       refresh_token_ciphertext FROM gmail_sources WHERE id = :id
+            """), {"id": source_id}).one()
+            assert row == ("needs_authorization", [], None, None, "encrypted-legacy")
+            assert connection.scalar(text("SELECT raw_mime FROM gmail_messages")) == b"retained evidence"
+        assert client.get("/health/ready").status_code == 200
+        engine.dispose()
+
+
+def _seed_legacy_plan(database_url, plan_id, name):
+    # A legacy schema must be seeded with its own contract, not the current ORM.
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("""INSERT INTO plans
+            (id, name, reporting_currency_code, budget_timezone, creation_fingerprint)
+            VALUES (:id, :name, 'BOB', 'America/La_Paz', :fp)"""),
+            {"id":plan_id,"name":name,"fp":"a"*64})
+        connection.execute(text("""INSERT INTO categories
+            (id, plan_id, name, is_pending, creation_fingerprint)
+            VALUES (:id, :plan, 'Pendientes', true, :fp)"""),
+            {"id":uuid4(),"plan":plan_id,"fp":"b"*64})
+    engine.dispose()
+
+
+def test_ynab_upgrade_backfills_existing_card_without_rewriting_rows(postgres_url):
+    with _temporary_database(postgres_url) as database_url:
+        config = _alembic_config(database_url)
+        command.upgrade(config, "009_watcher_runs")
+        plan, card, foreign = uuid4(), uuid4(), uuid4()
+        _seed_legacy_plan(database_url, plan, "Preserved Plan")
+        engine = create_engine(database_url)
+        with engine.begin() as connection:
+            for identity, currency in [(card,"BOB"),(foreign,"USDT")]:
+                connection.execute(text("""INSERT INTO accounts
+                  (id,plan_id,name,account_type,currency_code,creation_fingerprint)
+                  VALUES (:id,:plan,:name,'Credit Card',:currency,:fp)"""),
+                  dict(id=identity,plan=plan,name=str(identity),currency=currency,fp="c"*64))
+            before = connection.execute(text("SELECT * FROM accounts ORDER BY id")).all()
+            original = connection.execute(text("SELECT id,name,creation_fingerprint,created_at,updated_at FROM categories")).all()
+        command.upgrade(config,"head")
+        command.upgrade(config,"head")
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT * FROM accounts ORDER BY id")).all() == before
+            assert connection.execute(text("SELECT id,name,creation_fingerprint,created_at,updated_at FROM categories WHERE payment_account_id IS NULL")).all() == original
+            assert connection.execute(text("SELECT payment_account_id FROM categories WHERE payment_account_id IS NOT NULL")).scalars().all() == [card]
         engine.dispose()

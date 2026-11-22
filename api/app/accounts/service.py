@@ -225,6 +225,15 @@ def create_account(
         raise RuntimeError("created Account could not be loaded")
     if account.creation_fingerprint != fingerprint:
         raise CreationConflict("Account UUID has a different creation payload")
+    plan = get_plan(session, plan_id)
+    if account.account_type == "Credit Card" and account.currency_code == plan.reporting_currency_code:
+        from hashlib import md5
+        payment_id = UUID(md5(f"card-payment:{account.id}".encode()).hexdigest())
+        session.execute(insert(Category).values(
+            id=payment_id, plan_id=plan_id, name=f"Card payment · {account.id}",
+            payment_account_id=account.id, is_pending=False, status="active",
+            creation_fingerprint=_creation_fingerprint({"payment_account_id": str(account.id)})
+        ).on_conflict_do_nothing(index_elements=[Category.id]))
     return CreationResult(resource=account, created=inserted_id is not None)
 
 

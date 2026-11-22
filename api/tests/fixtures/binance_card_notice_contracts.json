@@ -1,0 +1,66 @@
+{
+  "provenance": "Synthetic reconstruction of a locally observed contract, not original email or provider-authenticated evidence.",
+  "privacy": "All amounts, merchants, dates, recipient addresses and message identifiers are invented. HTML layout is deliberately minimal; branding, links, tracking and hidden identifiers are omitted.",
+  "samples": [
+    {
+      "name": "success-one-fraction-digit",
+      "subject": "Binance Card - Transaction Successful - 2026-01-01 10:00:00 (UTC)",
+      "notification_date": "Thu, 01 Jan 2026 10:00:15 +0000",
+      "message_id": "<synthetic-success-one@example.invalid>",
+      "html": "<html><body><p>You’ve paid 12.5 USD at SYNTHETIC MERCHANT ALPHA. If this wasn’t you, please [REDACTED].</p></body></html>",
+      "expected_candidate": {
+        "reported_amount": "12.5",
+        "reported_currency": "USD",
+        "merchant": "SYNTHETIC MERCHANT ALPHA",
+        "event_at": "2026-01-01T10:00:00+00:00",
+        "settlement_amount": null,
+        "settlement_currency": null,
+        "account_id": null,
+        "disposition": "review_required_no_posting"
+      }
+    },
+    {
+      "name": "success-two-fraction-digits",
+      "subject": "Binance Card - Transaction Successful - 2026-01-02 11:00:00 (UTC)",
+      "notification_date": "Fri, 02 Jan 2026 11:00:15 +0000",
+      "message_id": "<synthetic-success-two@example.invalid>",
+      "html": "<html><body><p>You’ve paid 28.40 USD at SYNTHETIC MERCHANT BETA. If this wasn’t you, please [REDACTED].</p></body></html>",
+      "expected_candidate": {
+        "reported_amount": "28.40",
+        "reported_currency": "USD",
+        "merchant": "SYNTHETIC MERCHANT BETA",
+        "event_at": "2026-01-02T11:00:00+00:00",
+        "settlement_amount": null,
+        "settlement_currency": null,
+        "account_id": null,
+        "disposition": "review_required_no_posting"
+      }
+    },
+    {
+      "name": "success-another-merchant",
+      "subject": "Binance Card - Transaction Successful - 2026-01-03 12:00:00 (UTC)",
+      "notification_date": "Sat, 03 Jan 2026 12:00:15 +0000",
+      "message_id": "<synthetic-success-three@example.invalid>",
+      "html": "<html><body><p>You’ve paid 3.75 USD at SYNTHETIC MERCHANT GAMMA. If this wasn’t you, please [REDACTED].</p></body></html>",
+      "expected_candidate": {
+        "reported_amount": "3.75",
+        "reported_currency": "USD",
+        "merchant": "SYNTHETIC MERCHANT GAMMA",
+        "event_at": "2026-01-03T12:00:00+00:00",
+        "settlement_amount": null,
+        "settlement_currency": null,
+        "account_id": null,
+        "disposition": "review_required_no_posting"
+      }
+    },
+    {
+      "name": "failed-insufficient-balance-redacted",
+      "subject": "Binance Card - Transaction Failed - 2026-01-04 13:00:00 (UTC)",
+      "notification_date": "Sun, 04 Jan 2026 13:00:15 +0000",
+      "message_id": "<synthetic-failed-one@example.invalid>",
+      "html": "<html><body><p>Your [REDACTED] balance is [REDACTED] insufficient to [REDACTED] this transaction. Please [REDACTED] [REDACTED] your [REDACTED] and [REDACTED] [REDACTED].</p></body></html>",
+      "expected_candidate": null,
+      "expected_disposition": "non_success_notice_no_posting"
+    }
+  ]
+}

@@ -111,6 +111,7 @@ class CategoryResponse(BaseModel):
     group_id: UUID | None
     name: str
     is_pending: bool
+    payment_account_id: UUID | None = None
     status: Literal["active", "archived"]
     goal_type: Literal["target_balance", "monthly_funding", "due_date"] | None
     goal_target: StrictStr | None
@@ -350,6 +351,9 @@ class CategoryEnvelopeResponse(BaseModel):
     cash_overspending: StrictStr
     credit_card_overspending: StrictStr
     goal: "GoalResponse | None" = None
+    payment_account_id: UUID | None = None
+    payment_debt: StrictStr = "0"
+    payment_shortfall: StrictStr = "0"
     unconverted_by_currency: list[UnconvertedCurrencyResponse]
 
 
@@ -358,6 +362,7 @@ class GoalResponse(BaseModel):
     target: StrictStr
     due_month: str | None = None
     required_contribution: StrictStr
+    progress: int = 0
     status: Literal["completed", "funded", "on_track", "underfunded"]
 
 
@@ -370,5 +375,33 @@ class MonthlySummaryResponse(BaseModel):
     assigned_total: StrictStr
     activity_total: StrictStr
     available_total: StrictStr
+    assigned_in_future: StrictStr = "0"
+    cash_overspending: StrictStr = "0"
+    reconciliation_adjustments: StrictStr = "0"
+    credit_cash_inflow: StrictStr = "0"
     unconverted_by_currency: list[UnconvertedCurrencyResponse]
     categories: list[CategoryEnvelopeResponse]
+
+
+class BudgetActionCreate(StrictRequest):
+    kind: Literal["set_assigned", "move", "fund_target"]
+    month: str
+    category_id: UUID | None = None
+    source_category_id: UUID | None = None
+    amount: StrictStr | None = None
+
+    @model_validator(mode="after")
+    def validate_action(self) -> "BudgetActionCreate":
+        # Reuse the exact month grammar of immutable assignments.
+        AssignmentCreate(category_id=UUID(int=0), month=self.month, amount="0")
+        if self.kind in {"set_assigned", "fund_target"} and self.category_id is None:
+            raise ValueError("category_id is required")
+        if self.kind != "fund_target" and self.amount is None:
+            raise ValueError("amount is required")
+        if self.kind != "move" and self.source_category_id is not None:
+            raise ValueError("source_category_id is only valid for moves")
+        if self.kind == "fund_target" and self.amount is not None:
+            raise ValueError("target funding amount is calculated by the server")
+        if self.kind == "move" and self.category_id is None and self.source_category_id is None:
+            raise ValueError("choose a category source or destination")
+        return self

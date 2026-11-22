@@ -14,6 +14,7 @@ from app.accounts.service import account_balance, get_account, get_plan
 from app.db import session_scope
 from app.ledger.models import Category, CategoryGroup, MonthlyBudgetAssignment, Tag, Transaction, TransactionCorrection, Transfer, TransferLeg, PostedAccountMovement
 from app.ledger.schemas import (
+    BudgetActionCreate,
     AssignmentCreate,
     AssignmentResponse,
     CategoryCreate,
@@ -104,6 +105,7 @@ def _category_response(session: Session, category: Category) -> CategoryResponse
         {
             "id": category.id, "plan_id": category.plan_id, "group_id": category.group_id,
             "name": category.name, "is_pending": category.is_pending, "status": category.status,
+            "payment_account_id": category.payment_account_id,
             "goal_type": category.goal_type,
             "goal_target": fixed_amount(Decimal(category.goal_target), currency) if category.goal_target is not None else None,
             "goal_due_month": category.goal_due_month, "created_at": category.created_at,
@@ -652,18 +654,8 @@ def get_month_categories(
     plan_id: UUID, month: str, session: Session = Depends(get_database_session)
 ) -> list[CategoryEnvelopeResponse]:
     try:
-        categories = list_categories(session, plan_id)
-        return [
-            CategoryEnvelopeResponse.model_validate(
-                category_envelope(
-                    session,
-                    plan_id=plan_id,
-                    month_key=month,
-                    category_id=category.id,
-                )
-            )
-            for category in categories
-        ]
+        return [CategoryEnvelopeResponse.model_validate(e) for e in
+                monthly_summary(session, plan_id=plan_id, month_key=month)["categories"]]
     except ResourceNotFound as exc:
         raise _not_found(exc) from exc
     except LedgerValidationError as exc:
@@ -693,3 +685,21 @@ def get_month_category(
         raise _not_found(exc) from exc
     except LedgerValidationError as exc:
         raise _invalid(exc) from exc
+
+
+@router.put("/plans/{plan_id}/budget-actions/{action_id}", status_code=201)
+def put_budget_action(plan_id: UUID, action_id: UUID, payload: BudgetActionCreate,
+                      response: Response, session: Session = Depends(get_database_session)) -> dict:
+    from app.ledger.budget import act
+    try:
+        with session.begin():
+            result, created = act(session, plan_id, action_id, payload)
+    except ResourceNotFound as exc:
+        raise _not_found(exc) from exc
+    except CreationConflict as exc:
+        raise _conflict(exc) from exc
+    except LedgerValidationError as exc:
+        raise _invalid(exc) from exc
+    if not created:
+        response.status_code = 200
+    return result

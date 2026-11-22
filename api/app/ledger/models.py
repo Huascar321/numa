@@ -102,6 +102,7 @@ class Category(Base):
     is_pending: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+    payment_account_id: Mapped[UUID | None] = mapped_column(LedgerUUID, nullable=True)
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, server_default=text("'active'")
     )
@@ -523,6 +524,17 @@ class MonthlyBudgetAssignment(Base):
         LedgerJSON, nullable=False, server_default=text("'{}'::jsonb")
     )
     creation_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
+class BudgetAction(Base):
+    __tablename__ = "budget_actions"
+    id: Mapped[UUID] = mapped_column(LedgerUUID, primary_key=True)
+    plan_id: Mapped[UUID] = mapped_column(LedgerUUID, ForeignKey("plans.id"), nullable=False)
+    creation_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    result: Mapped[dict[str, Any]] = mapped_column(LedgerJSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )

@@ -56,6 +56,10 @@ export type Category = {
   group_id: string | null;
   name: string;
   is_pending: boolean;
+  payment_account_id?: string | null;
+  goal_type?: "target_balance" | "monthly_funding" | "due_date" | null;
+  goal_target?: string | null;
+  goal_due_month?: string | null;
   status: "active" | "archived";
   created_at: string;
   updated_at: string;
@@ -151,6 +155,13 @@ export type CategoryEnvelope = {
   assigned: string;
   activity: string;
   available: string;
+  rollover?: string;
+  cash_overspending?: string;
+  credit_card_overspending?: string;
+  payment_account_id?: string | null;
+  payment_debt?: string;
+  payment_shortfall?: string;
+  goal?: BudgetGoal | null;
   unconverted_by_currency: BudgetUnconverted[];
 };
 
@@ -162,9 +173,44 @@ export type MonthlySummary = {
   assigned_total: string;
   activity_total: string;
   available_total: string;
+  assigned_in_future?: string;
+  cash_overspending?: string;
+  reconciliation_adjustments?: string;
+  credit_cash_inflow?: string;
   unconverted_by_currency: BudgetUnconverted[];
   categories: CategoryEnvelope[];
 };
+
+export type BudgetGoal = {
+  type: "target_balance" | "monthly_funding" | "due_date";
+  target: string;
+  due_month?: string | null;
+  required_contribution: string;
+  progress: number;
+  status: "completed" | "funded" | "on_track" | "underfunded";
+};
+
+export type BudgetActionInput = {
+  kind: "set_assigned" | "move" | "fund_target";
+  month: string;
+  category_id?: string | null;
+  source_category_id?: string | null;
+  amount?: string;
+};
+
+export function budgetAction(planId: string, actionId: string, payload: BudgetActionInput): Promise<unknown> {
+  return request(`/plans/${planId}/budget-actions/${actionId}`, { method: "PUT", body: JSON.stringify(payload) });
+}
+
+export type GoalInput = {
+  goal_type: BudgetGoal["type"] | null;
+  goal_target: string | null;
+  goal_due_month: string | null;
+};
+
+export function updateGoal(planId: string, categoryId: string, payload: GoalInput): Promise<Category> {
+  return request<Category>(`/plans/${planId}/categories/${categoryId}`, { method: "PATCH", body: JSON.stringify(payload) });
+}
 
 export class ApiError extends Error {
   readonly status: number;
@@ -176,7 +222,7 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
     headers: {

@@ -432,8 +432,8 @@ def patch_category(
     session: Session, *, plan_id: UUID, category_id: UUID, payload: CategoryPatch
 ) -> Category:
     category = _get_category(session, plan_id, category_id)
-    if category.is_pending:
-        raise ProtectedResource("Pendientes is protected")
+    if category.is_pending or category.payment_account_id:
+        raise ProtectedResource("System category is protected")
     if category.status != "active":
         raise ArchivedResource("archived Categories cannot be mutated")
     if payload.name is not None:
@@ -472,8 +472,8 @@ def archive_category(
     session: Session, *, plan_id: UUID, category_id: UUID
 ) -> Category:
     category = _get_category(session, plan_id, category_id)
-    if category.is_pending:
-        raise ProtectedResource("Pendientes is protected")
+    if category.is_pending or category.payment_account_id:
+        raise ProtectedResource("System category is protected")
     if category.status == "active":
         category.status = "archived"
         category.updated_at = utc_now()
@@ -645,6 +645,8 @@ def create_transaction(
         if payload.category_id is None
         else _require_active_category(session, plan_id, payload.category_id)
     )
+    if category.payment_account_id:
+        raise ProtectedResource("Card payment categories cannot categorize transactions")
     tags = _validate_tag_ids(session, plan_id, payload.tags)
     if payload.type not in {"income", "expense"}:
         raise LedgerValidationError("only income and expense are public transaction types")
@@ -1140,6 +1142,8 @@ def correct_transaction(
     target_category_id = payload.category_id if "category_id" in fields else transaction.category_id
     assert target_category_id is not None
     target_category = _get_category(session, plan_id, target_category_id)
+    if target_category.payment_account_id:
+        raise ProtectedResource("Card payment categories cannot categorize transactions")
     if target_category.status != "active":
         raise ArchivedResource("archived Categories reject correction destinations")
     target_merchant = payload.merchant if "merchant" in fields else transaction.merchant
@@ -1347,6 +1351,7 @@ def create_assignment(
     payload: AssignmentCreate,
 ) -> CreationResult[MonthlyBudgetAssignment]:
     plan = _get_plan(session, plan_id)
+    session.scalar(select(Plan).where(Plan.id == plan_id).with_for_update())
     category = _require_active_category(session, plan_id, payload.category_id)
     month_key = payload.month_key or payload.month
     if month_key is None:
@@ -1432,35 +1437,6 @@ def _month_bounds(plan: Plan, month_key: str) -> tuple[datetime, datetime]:
     return start, end
 
 
-def _budget_movements(
-    session: Session, plan: Plan, month_key: str
-) -> list[PostedAccountMovement]:
-    start, end = _month_bounds(plan, month_key)
-    return list(
-        session.scalars(
-            select(PostedAccountMovement)
-            .where(
-                PostedAccountMovement.plan_id == plan.id,
-                PostedAccountMovement.effective_at >= start,
-                PostedAccountMovement.effective_at < end,
-            )
-            .order_by(PostedAccountMovement.effective_at, PostedAccountMovement.id)
-        )
-    )
-
-
-def _assignment_total(
-    session: Session, plan_id: UUID, month_key: str
-) -> Decimal:
-    result = session.scalar(
-        select(func.coalesce(func.sum(MonthlyBudgetAssignment.amount), 0)).where(
-            MonthlyBudgetAssignment.plan_id == plan_id,
-            MonthlyBudgetAssignment.month_key == month_key,
-        )
-    )
-    return Decimal(result or 0)
-
-
 def _unconverted_summary(
     session: Session,
     plan: Plan,
@@ -1514,129 +1490,15 @@ def _unconverted_summary(
     return result
 
 
-def _previous_month(month_key: str) -> str:
-    year, month = int(month_key[:4]), int(month_key[5:])
-    return f"{year - 1:04d}-12" if month == 1 else f"{year:04d}-{month - 1:02d}"
-
-
-def _category_first_month(
-    session: Session, plan: Plan, category_id: UUID, through_month: str
-) -> str | None:
-    assigned = session.scalars(
-        select(MonthlyBudgetAssignment.month_key).where(
-            MonthlyBudgetAssignment.plan_id == plan.id,
-            MonthlyBudgetAssignment.category_id == category_id,
-            MonthlyBudgetAssignment.month_key <= through_month,
-        )
-    )
-    months = list(assigned)
-    _, end = _month_bounds(plan, through_month)
-    movements = session.scalars(
-        select(PostedAccountMovement.effective_at).where(
-            PostedAccountMovement.plan_id == plan.id,
-            PostedAccountMovement.category_id == category_id,
-            PostedAccountMovement.currency_code == plan.reporting_currency_code,
-            PostedAccountMovement.transaction_type == "expense",
-            PostedAccountMovement.effective_at < end,
-        )
-    )
-    zone = ZoneInfo(plan.budget_timezone)
-    months.extend(item.astimezone(zone).strftime("%Y-%m") for item in movements)
-    return min(months) if months else None
-
-
-def _category_budget_values(
-    session: Session, plan: Plan, category: Category, month_key: str
-) -> dict[str, Decimal]:
-    first_month = _category_first_month(session, plan, category.id, month_key)
-    if first_month is None or month_key < first_month:
-        return {"rollover": Decimal(0), "assigned": Decimal(0), "activity": Decimal(0),
-                "available": Decimal(0), "cash_overspending": Decimal(0),
-                "credit_card_overspending": Decimal(0)}
-    account_types: dict[UUID, str] = {
-        account_id: account_type
-        for account_id, account_type in session.execute(
-            select(Account.id, Account.account_type).where(Account.plan_id == plan.id)
-        ).tuples()
-    }
-    values = {"rollover": Decimal(0), "assigned": Decimal(0), "activity": Decimal(0),
-              "available": Decimal(0), "cash_overspending": Decimal(0),
-              "credit_card_overspending": Decimal(0)}
-    current = first_month
-    prior_available = Decimal(0)
-    while current <= month_key:
-        assigned = Decimal(session.scalar(
-            select(func.coalesce(func.sum(MonthlyBudgetAssignment.amount), 0)).where(
-                MonthlyBudgetAssignment.plan_id == plan.id,
-                MonthlyBudgetAssignment.category_id == category.id,
-                MonthlyBudgetAssignment.month_key == current,
-            )
-        ) or 0)
-        movements = [
-            item for item in _budget_movements(session, plan, current)
-            if item.category_id == category.id
-            and item.currency_code == plan.reporting_currency_code
-            and item.transaction_type == "expense"
-        ]
-        replacement_sequences = {
-            transaction_id: sequence
-            for transaction_id, sequence in session.execute(
-                select(
-                    PostedAccountMovement.transaction_id,
-                    func.max(PostedAccountMovement.correction_sequence),
-                )
-                .where(
-                    PostedAccountMovement.plan_id == plan.id,
-                    PostedAccountMovement.transaction_id.in_(
-                        [item.transaction_id for item in movements]
-                    ),
-                    PostedAccountMovement.movement_kind == "replacement",
-                )
-                .group_by(PostedAccountMovement.transaction_id)
-            ).tuples()
-        } if movements else {}
-        movements = [
-            item for item in movements
-            if (
-                item.movement_kind == "original"
-                and item.transaction_id not in replacement_sequences
-            )
-            or (
-                item.movement_kind == "replacement"
-                and item.correction_sequence == replacement_sequences[item.transaction_id]
-            )
-        ]
-        # Effective time and transaction UUID are the financing order. Movement
-        # UUID only disambiguates append-only correction rows for one transaction.
-        movements.sort(key=lambda item: (item.effective_at, item.transaction_id, item.id))
-        rollover = max(prior_available, Decimal(0))
-        funded = rollover + assigned
-        activity = Decimal(0)
-        cash_excess = Decimal(0)
-        card_excess = Decimal(0)
-        for movement in movements:
-            amount = -Decimal(movement.signed_amount)
-            activity -= amount
-            financed = min(max(funded, Decimal(0)), amount)
-            excess = amount - financed
-            funded -= amount
-            if excess > 0:
-                if account_types.get(movement.account_id) == "Credit Card":
-                    card_excess += excess
-                else:
-                    cash_excess += excess
-        available = max(funded, Decimal(0))
-        values = {"rollover": rollover, "assigned": assigned, "activity": activity,
-                  "available": available, "cash_overspending": cash_excess,
-                  "credit_card_overspending": card_excess}
-        prior_available = available
-        current = _next_month(current)
-    return values
-
-
 def _next_month(month_key: str) -> str:
     year, month = int(month_key[:4]), int(month_key[5:])
     return f"{year + 1:04d}-01" if month == 12 else f"{year:04d}-{month + 1:02d}"
+
+
+def _goal_progress(current: Decimal, target: Decimal) -> int:
+    if target <= 0:
+        return 0
+    return int(min(max(current, Decimal(0)) / target, Decimal(1)) * 100)
 
 
 def _goal_response(category: Category, values: dict[str, Decimal], currency: Currency, month_key: str) -> dict[str, Any] | None:
@@ -1648,111 +1510,40 @@ def _goal_response(category: Category, values: dict[str, Decimal], currency: Cur
         completed = available >= target
         return {"type": "target_balance", "target": fixed_amount(target, currency),
                 "required_contribution": fixed_amount(max(target - available, Decimal(0)), currency),
+                "progress": _goal_progress(available, target),
                 "status": "completed" if completed else "underfunded"}
     if category.goal_type == "monthly_funding":
         funded = assigned >= target
         return {"type": "monthly_funding", "target": fixed_amount(target, currency),
-                "required_contribution": fixed_amount(target, currency),
+                "required_contribution": fixed_amount(max(target - assigned, Decimal(0)), currency),
+                "progress": _goal_progress(assigned, target),
                 "status": "funded" if funded else "underfunded"}
     assert category.goal_due_month is not None
     shortfall = max(target - available, Decimal(0))
-    if category.goal_due_month <= month_key:
-        required = shortfall
-    else:
+    remaining = 1
+    if category.goal_due_month > month_key:
         year, month = int(month_key[:4]), int(month_key[5:])
         due_year, due_month = int(category.goal_due_month[:4]), int(category.goal_due_month[5:])
         remaining = (due_year - year) * 12 + due_month - month + 1
-        required = shortfall / Decimal(remaining)
-    required = required.quantize(Decimal(1).scaleb(-currency.decimal_places))
-    status = "completed" if shortfall == 0 else ("on_track" if assigned >= required else "underfunded")
+    beginning = available - assigned
+    needed = max(target - beginning, Decimal(0)) / Decimal(remaining)
+    quantum = Decimal(1).scaleb(-currency.decimal_places)
+    from decimal import ROUND_CEILING
+    needed = needed.quantize(quantum, rounding=ROUND_CEILING)
+    required = min(shortfall, max(needed - assigned, Decimal(0)))
+    status = "completed" if shortfall == 0 else ("on_track" if required == 0 else "underfunded")
     return {"type": "due_date", "target": fixed_amount(target, currency),
             "due_month": category.goal_due_month,
-            "required_contribution": fixed_amount(required, currency), "status": status}
+            "required_contribution": fixed_amount(required, currency),
+            "progress": _goal_progress(available, target), "status": status}
 
 
-def category_envelope(
-    session: Session, *, plan_id: UUID, month_key: str, category_id: UUID
-) -> dict[str, Any]:
-    plan = _get_plan(session, plan_id)
-    category = _get_category(session, plan_id, category_id)
-    currency = require_currency(session, plan.reporting_currency_code)
-    movements = _budget_movements(session, plan, month_key)
-    values = _category_budget_values(session, plan, category, month_key)
-    assigned, activity, available = values["assigned"], values["activity"], values["available"]
-    unconverted = _unconverted_summary(
-        session, plan, movements, category_id=category_id
-    )
-    return {
-        "plan_id": plan_id,
-        "category_id": category.id,
-        "month": month_key,
-        "currency": currency.code,
-        "assigned": fixed_amount(assigned, currency),
-        "activity": fixed_amount(activity, currency),
-        "available": fixed_amount(available, currency),
-        "assigned_money": {"amount": fixed_amount(assigned, currency), "currency": currency.code},
-        "activity_money": {"amount": fixed_amount(activity, currency), "currency": currency.code},
-        "available_money": {"amount": fixed_amount(available, currency), "currency": currency.code},
-        "rollover": fixed_amount(values["rollover"], currency),
-        "cash_overspending": fixed_amount(values["cash_overspending"], currency),
-        "credit_card_overspending": fixed_amount(values["credit_card_overspending"], currency),
-        "goal": _goal_response(category, values, currency, month_key),
-        "unconverted_by_currency": unconverted,
-    }
+def category_envelope(session: Session, *, plan_id: UUID, month_key: str, category_id: UUID) -> dict[str, Any]:
+    from app.ledger.budget import project
+    _get_category(session, plan_id, category_id)
+    return next(e for e in project(session, plan_id, month_key)["categories"] if e["category_id"] == category_id)
 
 
-def monthly_summary(
-    session: Session, *, plan_id: UUID, month_key: str
-) -> dict[str, Any]:
-    plan = _get_plan(session, plan_id)
-    currency = require_currency(session, plan.reporting_currency_code)
-    movements = _budget_movements(session, plan, month_key)
-    income = sum(
-        (
-            Decimal(movement.signed_amount)
-            for movement in movements
-            if movement.currency_code == plan.reporting_currency_code
-            and movement.transaction_type == "income"
-        ),
-        Decimal(0),
-    )
-    assigned_total = _assignment_total(session, plan_id, month_key)
-    activity_total = sum(
-        (
-            Decimal(movement.signed_amount)
-            for movement in movements
-            if movement.currency_code == plan.reporting_currency_code
-            and movement.transaction_type == "expense"
-        ),
-        Decimal(0),
-    )
-    categories = list_categories(session, plan_id)
-    envelopes = [
-        category_envelope(
-            session, plan_id=plan_id, month_key=month_key, category_id=category.id
-        )
-        for category in categories
-    ]
-    previous_values = [
-        _category_budget_values(session, plan, category, _previous_month(month_key))
-        for category in categories
-    ]
-    cash_overspending = sum(
-        (item["cash_overspending"] for item in previous_values), Decimal(0)
-    )
-    ready = income - assigned_total - cash_overspending
-    available_total = sum(
-        (Decimal(envelope["available"]) for envelope in envelopes), Decimal(0)
-    )
-    return {
-        "plan_id": plan_id,
-        "month": month_key,
-        "currency": currency.code,
-        "ready_to_assign": fixed_amount(ready, currency),
-        "ready_to_assign_money": {"amount": fixed_amount(ready, currency), "currency": currency.code},
-        "assigned_total": fixed_amount(assigned_total, currency),
-        "activity_total": fixed_amount(activity_total, currency),
-        "available_total": fixed_amount(available_total, currency),
-        "unconverted_by_currency": _unconverted_summary(session, plan, movements),
-        "categories": envelopes,
-    }
+def monthly_summary(session: Session, *, plan_id: UUID, month_key: str) -> dict[str, Any]:
+    from app.ledger.budget import project
+    return project(session, plan_id, month_key)

@@ -1,6 +1,7 @@
 .DS_Store
 .env
 .env.numa-test
+.env.numa-dev
 __pycache__/
 .pytest_cache/
 *.py[cod]
@@ -12,3 +13,6 @@ web/*.tsbuildinfo
 /emails/
 /bank_statements/
 /extracto-bg-*.csv
+
+.playwright-cli/
+output/playwright/

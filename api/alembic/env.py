@@ -11,6 +11,9 @@ from app.jobs import models  # noqa: F401 - registers migration metadata
 from app.ledger import models as ledger_models  # noqa: F401 - ledger metadata
 from app.reconciliation import models as reconciliation_models  # noqa: F401 - reconciliation metadata
 from app.settings import Settings
+from app.gmail import models as gmail_models  # noqa: F401 - Gmail metadata
+from app.binance_card import models as binance_models  # noqa: F401 - review metadata
+from app.watchers import models as watcher_models  # noqa: F401 - pipeline metadata
 
 config = context.config
 

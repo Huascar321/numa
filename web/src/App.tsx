@@ -1,4 +1,11 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
+import { GmailScreen } from "./GmailScreen";
+import { ExpenseEntry } from "./ExpenseEntry";
+import { TransactionRegister } from "./TransactionRegister";
+import { WorkspaceLayout } from "./WorkspaceLayout";
+import { LedgerNavigation } from "./LedgerNavigation";
+import { BudgetScreen } from "./BudgetWorkspace";
+import { formatMoney } from "./money";
 import {
   Link,
   Navigate,
@@ -6,6 +13,7 @@ import {
   Routes,
   useNavigate,
   useParams,
+  useSearchParams,
 } from "react-router";
 import {
   useMutation,
@@ -30,14 +38,11 @@ import {
   CategoryGroup,
   Tag,
   Transaction,
-  createAssignment,
   createCategory,
   createCategoryGroup,
   createTag,
-  createTransaction,
   getCategories,
   getCategoryGroups,
-  getMonthlySummary,
   getTags,
   getTransactions,
   archiveCategory,
@@ -46,8 +51,6 @@ import {
   renameCategory,
   renameCategoryGroup,
   renameTag,
-  correctTransaction,
-  getTransactionCorrections,
   Transfer,
   getTransfers,
   createTransfer,
@@ -124,8 +127,38 @@ function PlanScreen() {
           <p className="eyebrow">Numa workspace</p>
           <h1>Plans</h1>
           <p>Select an independent Plan before managing its Accounts.</p>
+          <a className="text-action" href="#create-plan-heading">New plan <span aria-hidden="true">↗</span></a>
         </div>
       </header>
+
+      <section className="panel" aria-labelledby="plans-heading">
+        <h2 id="plans-heading">Your Plans</h2>
+        {plans.isPending && <p role="status">Loading Plans…</p>}
+        {plans.isError && <ErrorMessage message="Plans could not be loaded." />}
+        {plans.data?.length === 0 && <p>No Plans yet.</p>}
+        <div className="card-list">
+          {plans.data?.map((plan) => (
+            <article className="card" key={plan.id}>
+              <div>
+                <h3>{plan.name}</h3>
+                <p>Reporting currency: <strong>{plan.reporting_currency_code}</strong></p>
+              </div>
+              <div className="card-actions">
+                <Link className="button" to={`/plans/${plan.id}/budget`}>Open Budget</Link>
+                <Link className="button" to={`/plans/${plan.id}/accounts`}>Manage Accounts</Link>
+                <button type="button" onClick={() => { setRenameId(plan.id); setRenameValue(plan.name); }}>Rename</button>
+              </div>
+              {renameId === plan.id && (
+                <form onSubmit={(event) => submitRename(event, plan.id)} className="inline-form">
+                  <label>New name<input required value={renameValue} onChange={(event) => setRenameValue(event.target.value)} /></label>
+                  <button type="submit" disabled={renameMutation.isPending}>Save</button>
+                  <button type="button" onClick={() => setRenameId(null)}>Cancel</button>
+                </form>
+              )}
+            </article>
+          ))}
+        </div>
+      </section>
 
       <section className="panel" aria-labelledby="create-plan-heading">
         <h2 id="create-plan-heading">Create a Plan</h2>
@@ -165,48 +198,6 @@ function PlanScreen() {
         )}
       </section>
 
-      <section className="panel" aria-labelledby="plans-heading">
-        <h2 id="plans-heading">Your Plans</h2>
-        {plans.isPending && <p>Loading Plans…</p>}
-        {plans.isError && <ErrorMessage message="Plans could not be loaded." />}
-        {plans.data?.length === 0 && <p>No Plans yet.</p>}
-        <div className="card-list">
-          {plans.data?.map((plan) => (
-            <article className="card" key={plan.id}>
-              <div>
-                <h3>{plan.name}</h3>
-                <p>Reporting currency: <strong>{plan.reporting_currency_code}</strong></p>
-              </div>
-              <div className="card-actions">
-                <Link className="button" to={`/plans/${plan.id}/accounts`}>Manage Accounts</Link>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRenameId(plan.id);
-                    setRenameValue(plan.name);
-                  }}
-                >
-                  Rename
-                </button>
-              </div>
-              {renameId === plan.id && (
-                <form onSubmit={(event) => submitRename(event, plan.id)} className="inline-form">
-                  <label>
-                    New name
-                    <input
-                      required
-                      value={renameValue}
-                      onChange={(event) => setRenameValue(event.target.value)}
-                    />
-                  </label>
-                  <button type="submit" disabled={renameMutation.isPending}>Save</button>
-                  <button type="button" onClick={() => setRenameId(null)}>Cancel</button>
-                </form>
-              )}
-            </article>
-          ))}
-        </div>
-      </section>
     </main>
   );
 }
@@ -241,10 +232,13 @@ function AccountCard({ account, planId }: { account: Account; planId: string }) 
         <span className={`status status-${account.status}`}>{account.status}</span>
       </div>
       <p className="balance">
-        Balance <strong>{account.balance.amount} {account.balance.currency}</strong>
+        Balance <strong>{formatMoney(account.balance.amount, account.balance.currency)}</strong>
       </p>
-      {account.status === "active" && (
-        <div className="card-actions">
+      <div className="card-actions">
+        <Link className="text-action" to={`/plans/${planId}/ledger?account=${account.id}`}>
+          View activity <span aria-hidden="true">↗</span>
+        </Link>
+        {account.status === "active" && <>
           <button type="button" onClick={() => setEditing(true)}>Rename</button>
           <button
             type="button"
@@ -253,8 +247,8 @@ function AccountCard({ account, planId }: { account: Account; planId: string }) 
           >
             {archiveMutation.isPending ? "Archiving…" : "Archive"}
           </button>
-        </div>
-      )}
+        </>}
+      </div>
       {editing && account.status === "active" && (
         <form
           className="inline-form"
@@ -309,15 +303,28 @@ function AccountsScreen() {
   if (!planId) return <Navigate to="/plans" replace />;
 
   return (
-    <main className="page">
+    <main className="workspace-page">
       <header className="page-header">
         <div>
-          <Link to="/plans">← Plans</Link>
-          <p className="eyebrow">Selected Plan</p>
-          <h1>{plan.data?.name ?? "Accounts"}</h1>
+          <p className="eyebrow">Your financial accounts</p>
+          <h1>Accounts</h1>
           <p>Reporting currency: {plan.data?.reporting_currency_code ?? "…"}</p>
         </div>
+        <a className="button" href="#create-account-heading">+ New account</a>
       </header>
+
+      <section className="panel" aria-labelledby="accounts-heading">
+        <div className="section-heading">
+          <h2 id="accounts-heading">Accounts</h2>
+          <Link className="text-action" to={`/plans/${planId}/ledger`}>View all activity <span aria-hidden="true">↗</span></Link>
+        </div>
+        {accounts.isPending && <p role="status">Loading Accounts…</p>}
+        {accounts.isError && <ErrorMessage message="Accounts could not be loaded." />}
+        {accounts.data?.length === 0 && <p>No Accounts yet.</p>}
+        <div className="card-list">
+          {accounts.data?.map((account) => <AccountCard key={account.id} account={account} planId={planId} />)}
+        </div>
+      </section>
 
       <section className="panel" aria-labelledby="create-account-heading">
         <h2 id="create-account-heading">Create an Account</h2>
@@ -365,18 +372,6 @@ function AccountsScreen() {
         {createMutation.isError && <ErrorMessage message={createMutation.error.message} />}
       </section>
 
-      <section className="panel" aria-labelledby="accounts-heading">
-        <h2 id="accounts-heading">Accounts</h2>
-        {accounts.isPending && <p>Loading Accounts…</p>}
-        {accounts.isError && <ErrorMessage message="Accounts could not be loaded." />}
-        {accounts.data?.length === 0 && <p>No Accounts yet.</p>}
-        <div className="card-list">
-          {accounts.data?.map((account) => (
-            <AccountCard key={account.id} account={account} planId={planId} />
-          ))}
-        </div>
-      </section>
-      <p><Link className="button" to={`/plans/${planId}/ledger`}>Open Ledger</Link></p>
     </main>
   );
 }
@@ -432,7 +427,7 @@ function TaxonomyPanel({ planId }: { planId: string }) {
       </div>
       <div className="taxonomy-lists">
         <div><h3>Groups</h3>{groups.data?.map((group) => <TaxonomyItem key={group.id} label={group.name} status={group.status} protectedItem={false} onRename={(name) => renameCategoryGroup(planId, group.id, name).then(() => invalidate("category-groups"))} onArchive={() => archiveCategoryGroup(planId, group.id).then(() => invalidate("category-groups"))} />)}</div>
-        <div><h3>Categories</h3>{categories.data?.map((category) => <TaxonomyItem key={category.id} label={category.name} status={category.status} protectedItem={category.is_pending} onRename={(name) => renameCategory(planId, category.id, { name }).then(() => invalidate("categories"))} onArchive={() => archiveCategory(planId, category.id).then(() => invalidate("categories"))} />)}</div>
+        <div><h3>Categories</h3>{categories.data?.map((category) => <TaxonomyItem key={category.id} label={category.name} status={category.status} protectedItem={category.is_pending || Boolean(category.payment_account_id)} onRename={(name) => renameCategory(planId, category.id, { name }).then(() => invalidate("categories"))} onArchive={() => archiveCategory(planId, category.id).then(() => invalidate("categories"))} />)}</div>
         <div><h3>Tags</h3>{tags.data?.map((tag) => <TaxonomyItem key={tag.id} label={tag.name} status={tag.status} protectedItem={false} onRename={(name) => renameTag(planId, tag.id, name).then(() => invalidate("tags"))} onArchive={() => archiveTag(planId, tag.id).then(() => invalidate("tags"))} />)}</div>
       </div>
     </section>
@@ -445,48 +440,22 @@ function TaxonomyItem({ label, status, protectedItem, onRename, onArchive }: { l
   return <div className="taxonomy-item"><div>{editing ? <input aria-label={`Rename ${label}`} value={name} onChange={(event) => setName(event.target.value)} /> : <strong>{label}</strong>} <span>{protectedItem ? "protected" : status}</span></div>{!protectedItem && status === "active" && <div className="card-actions">{editing ? <><button type="button" onClick={() => onRename(name).then(() => setEditing(false))}>Save</button><button type="button" onClick={() => setEditing(false)}>Cancel</button></> : <button type="button" onClick={() => setEditing(true)}>Rename</button>}<button type="button" onClick={() => void onArchive()}>Archive</button></div>}</div>;
 }
 
-function parseOptionalJson(value: string, field: string): Record<string, unknown> | undefined {
-  if (!value.trim()) return undefined;
-  try {
-    const parsed: unknown = JSON.parse(value);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      throw new Error(`${field} must be a JSON object.`);
-    }
-    return parsed as Record<string, unknown>;
-  } catch (error) {
-    if (error instanceof Error && error.message.endsWith("must be a JSON object.")) {
-      throw error;
-    }
-    throw new Error(`${field} must be valid JSON.`);
-  }
-}
-
-function TransactionPanel({ planId, accounts, categories }: { planId: string; accounts: Account[]; categories: Category[] }) {
+function TransactionPanel({ planId, accounts, categories, entryOpen, closeEntry, onSaved }: { planId: string; accounts: Account[]; categories: Category[]; entryOpen: boolean; closeEntry: () => void; onSaved: () => void }) {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const accountFilter = searchParams.get("account") ?? "";
+  const setAccountFilter = (accountId: string) => {
+    const next = new URLSearchParams(searchParams);
+    if (accountId) next.set("account", accountId);
+    else next.delete("account");
+    setSearchParams(next, { replace: true });
+  };
   const queryClient = useQueryClient();
   const transactions = useQuery({ queryKey: ["plans", planId, "transactions"], queryFn: () => getTransactions(planId) });
   const tags = useQuery({ queryKey: ["plans", planId, "tags"], queryFn: () => getTags(planId) });
-  const [accountId, setAccountId] = useState(accounts[0]?.id ?? "");
-  const [categoryId, setCategoryId] = useState("");
-  const [amount, setAmount] = useState("");
-  const [type, setType] = useState<"income" | "expense">("expense");
-  const [eventAt, setEventAt] = useState(new Date().toISOString().slice(0, 16));
-  const [merchant, setMerchant] = useState("");
-  const [memo, setMemo] = useState("");
-  const [photoReference, setPhotoReference] = useState("");
-  const [locationJson, setLocationJson] = useState("");
-  const [sourceMetadataJson, setSourceMetadataJson] = useState("");
-  const [provenanceJson, setProvenanceJson] = useState("");
-  const [selectedTags, setSelectedTags] = useState<string[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [correctionAmount, setCorrectionAmount] = useState("");
   const ordinaryTransactions = (transactions.data ?? []).filter(
     (item): item is Transaction => !("legs" in item)
       && (item.type === "income" || item.type === "expense"),
   );
-  const selected = ordinaryTransactions.find((transaction) => transaction.id === selectedId) ?? null;
-  useEffect(() => {
-    if (!accountId && accounts[0]) setAccountId(accounts[0].id);
-  }, [accountId, accounts]);
   const invalidateLedgerProjections = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["plans", planId, "transactions"] }),
@@ -494,65 +463,28 @@ function TransactionPanel({ planId, accounts, categories }: { planId: string; ac
       queryClient.invalidateQueries({ queryKey: ["plans", planId, "budget"] }),
     ]);
   };
-  const postMutation = useMutation({
-    mutationFn: () => {
-      const account = accounts.find((item) => item.id === accountId);
-      if (!account) throw new Error("Select an active Account.");
-      return createTransaction(planId, newClientId(), {
-        type, account_id: accountId, amount, currency_code: account.currency_code,
-        event_at: new Date(eventAt).toISOString(), category_id: categoryId || undefined,
-        merchant: merchant || undefined, memo: memo || undefined,
-        photo_reference: photoReference || undefined,
-        tags: selectedTags,
-        location: parseOptionalJson(locationJson, "Location"),
-        source_metadata: parseOptionalJson(sourceMetadataJson, "Source metadata"),
-        provenance: parseOptionalJson(provenanceJson, "Provenance"),
-      });
-    },
-    onSuccess: async () => { await invalidateLedgerProjections(); setAmount(""); setMerchant(""); setMemo(""); setPhotoReference(""); setLocationJson(""); setSourceMetadataJson(""); setProvenanceJson(""); setSelectedTags([]); },
-  });
-  const correctionMutation = useMutation({
-    mutationFn: () => selected ? correctTransaction(planId, selected.id, newClientId(), { amount: correctionAmount }) : Promise.reject(new Error("Select a Transaction.")),
-    onSuccess: async () => { await invalidateLedgerProjections(); await queryClient.invalidateQueries({ queryKey: ["plans", planId, "transactions", selectedId, "corrections"] }); },
-  });
-  const corrections = useQuery({
-    queryKey: ["plans", planId, "transactions", selectedId, "corrections"],
-    queryFn: () => getTransactionCorrections(planId, selectedId ?? ""),
-    enabled: Boolean(selectedId),
-  });
   return (
     <section className="panel" aria-labelledby="transactions-heading">
-      <h2 id="transactions-heading">Manual Transactions</h2>
-      <form className="form-grid" onSubmit={(event) => { event.preventDefault(); postMutation.mutate(); }}>
-        <label>Type<select value={type} onChange={(event) => setType(event.target.value as "income" | "expense")}><option value="expense">Expense</option><option value="income">Income</option></select></label>
-        <label>Account<select value={accountId} onChange={(event) => setAccountId(event.target.value)}>{accounts.filter((account) => account.status === "active").map((account) => <option key={account.id} value={account.id}>{account.name} · {account.currency_code}</option>)}</select></label>
-        <label>Amount (exact decimal string)<input inputMode="decimal" value={amount} onChange={(event) => setAmount(event.target.value)} required /></label>
-        <p className="field-help">Use an exact decimal string in {accounts.find((account) => account.id === accountId)?.currency_code ?? "the Account currency"}; floats are rejected.</p>
-        <label>Event timestamp<input type="datetime-local" value={eventAt} onChange={(event) => setEventAt(event.target.value)} required /></label>
-        <label>Category<select value={categoryId} onChange={(event) => setCategoryId(event.target.value)}><option value="">Pendientes</option>{categories.filter((category) => category.status === "active").map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></label>
-        <label>Merchant<input value={merchant} onChange={(event) => setMerchant(event.target.value)} /></label>
-        <label>Memo<input value={memo} onChange={(event) => setMemo(event.target.value)} /></label>
-        <label>Photo reference (opaque)<input value={photoReference} onChange={(event) => setPhotoReference(event.target.value)} /></label>
-        <label>Location JSON<input value={locationJson} onChange={(event) => setLocationJson(event.target.value)} placeholder='{"city":"La Paz"}' /></label>
-        <label>Source metadata JSON<input value={sourceMetadataJson} onChange={(event) => setSourceMetadataJson(event.target.value)} placeholder="{}" /></label>
-        <label>Provenance JSON<input value={provenanceJson} onChange={(event) => setProvenanceJson(event.target.value)} placeholder="{}" /></label>
-        <fieldset className="tag-fieldset"><legend>Tags</legend>{tags.data?.filter((tag) => tag.status === "active").map((tag) => <label key={tag.id}><input type="checkbox" checked={selectedTags.includes(tag.id)} onChange={(event) => setSelectedTags((current) => event.target.checked ? [...current, tag.id] : current.filter((id) => id !== tag.id))} />{tag.name}</label>)}</fieldset>
-        <button type="submit" disabled={postMutation.isPending || !accountId}>{postMutation.isPending ? "Posting…" : "Post"}</button>
-      </form>
-      {postMutation.isError && <ErrorMessage message={postMutation.error.message} />}
-        <div className="card-list">{ordinaryTransactions.map((transaction) => <article className="card" key={transaction.id}><strong>{transaction.type} {transaction.amount} {transaction.currency_code}</strong><p>{transaction.merchant || "No merchant"} · {transaction.memo || "No memo"}</p><button type="button" onClick={() => { setSelectedId(transaction.id); setCorrectionAmount(transaction.amount); }}>View detail and correct</button>{selected?.id === transaction.id && <><div className="transaction-detail"><p>Account {transaction.account_id}</p><p>Category {categories.find((category) => category.id === transaction.category_id)?.name ?? transaction.category_id}</p><p>Event {transaction.event_at}</p></div><form className="inline-form" onSubmit={(event) => { event.preventDefault(); correctionMutation.mutate(); }}><label>Replacement amount<input value={correctionAmount} onChange={(event) => setCorrectionAmount(event.target.value)} required /></label><button type="submit" disabled={correctionMutation.isPending}>{correctionMutation.isPending ? "Saving…" : "Save correction"}</button><button type="button" onClick={() => setSelectedId(null)}>Close</button></form><div><strong>Correction history</strong>{corrections.isPending && <p>Loading correction history…</p>}{corrections.data?.map((correction) => <p key={correction.id}>#{correction.correction_sequence}: {String(correction.before_snapshot.amount)} → {String(correction.after_snapshot.amount)}</p>)}</div></>}</article>)}</div>
+      <h2 id="transactions-heading">Transactions</h2>
+      <p className="section-intro">Record an expense or income. Corrections keep the original history.</p>
+      {transactions.isPending && <p role="status">Loading activity…</p>}
+      {transactions.isError && <ErrorMessage message="Activity could not be loaded." />}
+      {transactions.isSuccess && (
+        <TransactionRegister
+          planId={planId}
+          transactions={ordinaryTransactions}
+          accounts={accounts}
+          categories={categories}
+          tags={tags.data ?? []}
+          accountFilter={accountFilter}
+          onAccountFilterChange={setAccountFilter}
+          entry={entryOpen ? <ExpenseEntry key={planId} planId={planId} accounts={accounts} accountId={accountFilter || undefined}
+            inRegister onClose={closeEntry} onSaved={onSaved} /> : undefined}
+          onChanged={invalidateLedgerProjections}
+        />
+      )}
     </section>
   );
-}
-
-function BudgetPanel({ planId, categories }: { planId: string; categories: Category[] }) {
-  const queryClient = useQueryClient();
-  const [month, setMonth] = useState(new Date().toISOString().slice(0, 7));
-  const [categoryId, setCategoryId] = useState("");
-  const [amount, setAmount] = useState("");
-  const summary = useQuery({ queryKey: ["plans", planId, "budget", month], queryFn: () => getMonthlySummary(planId, month) });
-  const assignment = useMutation({ mutationFn: () => createAssignment(planId, newClientId(), { category_id: categoryId, month, amount }), onSuccess: () => { setAmount(""); void queryClient.invalidateQueries({ queryKey: ["plans", planId, "budget", month] }); } });
-  return <section className="panel" aria-labelledby="budget-heading"><h2 id="budget-heading">Budget month</h2><label>Month<input type="month" value={month} onChange={(event) => setMonth(event.target.value)} /></label>{summary.data && <><p>Ready to Assign <strong>{summary.data.ready_to_assign} {summary.data.currency}</strong></p><form className="inline-form" onSubmit={(event) => { event.preventDefault(); assignment.mutate(); }}><label>Category<select value={categoryId} onChange={(event) => setCategoryId(event.target.value)} required><option value="">Select category</option>{categories.filter((category) => category.status === "active").map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></label><label>Assignment (exact decimal string)<input value={amount} onChange={(event) => setAmount(event.target.value)} required /></label><button type="submit">Assign</button></form><div className="card-list">{summary.data.categories.map((envelope) => <article className="card" key={envelope.category_id}><strong>{categories.find((category) => category.id === envelope.category_id)?.name}</strong><p>Assigned {envelope.assigned} · Activity {envelope.activity} · Available {envelope.available} {envelope.currency}</p>{envelope.unconverted_by_currency.map((item) => <p key={item.currency} className="unconverted">Unconverted {item.currency}: {item.amount}</p>)}</article>)}</div>{summary.data.unconverted_by_currency.map((item) => <p className="unconverted" key={item.currency}>Unconverted {item.currency}: {item.amount}</p>)}</>}</section>;
 }
 
 function TransferPanel({ planId, accounts }: { planId: string; accounts: Account[] }) {
@@ -599,7 +531,7 @@ function TransferPanel({ planId, accounts }: { planId: string; accounts: Account
       {create.isError ? <ErrorMessage message={create.error.message} /> : null}
       <div className="card-list">{transfers.data?.map((transfer) => (
         <article className="card" key={transfer.id}>
-          <strong>Transfer {transfer.outbound_amount} {transfer.outbound_currency_code} → {transfer.inbound_amount} {transfer.inbound_currency_code}</strong>
+          <strong>Transfer {formatMoney(transfer.outbound_amount, transfer.outbound_currency_code)} → {formatMoney(transfer.inbound_amount, transfer.inbound_currency_code)}</strong>
           <p>Event {transfer.event_at}</p>
           <p>From {accounts.find((account) => account.id === transfer.source_account_id)?.name ?? transfer.source_account_id} ({transfer.source_account_id}) to {accounts.find((account) => account.id === transfer.destination_account_id)?.name ?? transfer.destination_account_id} ({transfer.destination_account_id})</p>
           <p>Rate {transfer.rate}{transfer.rate_source ? ` · ${transfer.rate_source}` : ""}</p>
@@ -757,9 +689,9 @@ function ReconciliationPanel({ planId, accounts }: { planId: string; accounts: A
       </form>
       {previewError ? <ErrorMessage message={previewError} /> : null}
       {comparison ? <div className="card reconciliation-preview">
-        <strong>Discrepancy {comparison.discrepancy.amount} {comparison.discrepancy.currency}</strong>
-        <p>Statement {comparison.statement_balance.amount} · Derived as of {comparison.statement_at}: {comparison.derived_balance.amount}</p>
-        <p>Policy {acceptedPreview?.policy} · tolerance {acceptedPreview?.tolerance.amount} {acceptedPreview?.tolerance.currency}</p>
+        <strong>Discrepancy {formatMoney(comparison.discrepancy.amount, comparison.discrepancy.currency)}</strong>
+        <p>Statement {formatMoney(comparison.statement_balance.amount, comparison.statement_balance.currency)} · Derived as of {comparison.statement_at}: {formatMoney(comparison.derived_balance.amount, comparison.derived_balance.currency)}</p>
+        <p>Policy {acceptedPreview?.policy} · tolerance {acceptedPreview ? formatMoney(acceptedPreview.tolerance.amount, acceptedPreview.tolerance.currency) : "—"}</p>
         {comparison.blocked ? <ErrorMessage message="Confirmation is blocked above the configured tolerance." /> : null}
         {comparison.requires_warning_acceptance ? <label className="warning-acceptance"><input type="checkbox" checked={warningAccepted} onChange={(event) => setWarningAccepted(event.target.checked)} />I explicitly accept this discrepancy warning.</label> : null}
         <button type="button" onClick={() => acceptedPreview && confirm.mutate({ snapshot: acceptedPreview, accepted: warningAccepted })} disabled={confirm.isPending || comparison.blocked || (comparison.requires_warning_acceptance && !warningAccepted)}>{confirm.isPending ? "Confirming…" : "Confirm reconciliation"}</button>
@@ -768,8 +700,8 @@ function ReconciliationPanel({ planId, accounts }: { planId: string; accounts: A
       <h3>Reconciliation history</h3>
       {history.isPending ? <p>Loading reconciliation history…</p> : null}
       <div className="card-list">{history.data?.map((item) => <article className="card" key={item.id}>
-        <strong>{item.discrepancy.amount} {item.discrepancy.currency} discrepancy</strong>
-        <p>Statement {item.statement_balance.amount} · derived {item.derived_balance.amount} · {item.statement_at}</p>
+        <strong>{formatMoney(item.discrepancy.amount, item.discrepancy.currency)} discrepancy</strong>
+        <p>Statement {formatMoney(item.statement_balance.amount, item.statement_balance.currency)} · derived {formatMoney(item.derived_balance.amount, item.derived_balance.currency)} · {item.statement_at}</p>
         <p>{item.adjustment_transaction_id ? `Adjustment ${item.adjustment_transaction_id}` : "Confirmed without adjustment"}</p>
       </article>)}</div>
     </section>
@@ -778,20 +710,54 @@ function ReconciliationPanel({ planId, accounts }: { planId: string; accounts: A
 
 function LedgerScreen() {
   const { planId } = useParams<{ planId: string }>();
+  const [searchParams] = useSearchParams();
   const accounts = useQuery({ queryKey: ["plans", planId, "accounts"], queryFn: () => getAccounts(planId ?? ""), enabled: Boolean(planId) });
   const categories = useQuery({ queryKey: ["plans", planId, "categories"], queryFn: () => getCategories(planId ?? ""), enabled: Boolean(planId) });
+  const [entryOpen, setEntryOpen] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const filter = searchParams.get("account");
+  useEffect(() => { setEntryOpen(false); setSaved(false); }, [filter, planId]);
+  const trigger = useRef<HTMLButtonElement>(null);
+  function closeEntry() { setEntryOpen(false); trigger.current?.focus(); }
+  const selectedAccount = accounts.data?.find((account) => account.id === searchParams.get("account"));
   if (!planId) return <Navigate to="/plans" replace />;
-  return <main className="page"><header className="page-header"><Link to={`/plans/${planId}/accounts`}>← Accounts</Link><p className="eyebrow">Ledger</p><h1>Ledger</h1><p>Exact, Plan-scoped activity and monthly envelopes.</p></header><TaxonomyPanel planId={planId} /><TransactionPanel planId={planId} accounts={accounts.data ?? []} categories={categories.data ?? []} /><TransferPanel planId={planId} accounts={accounts.data ?? []} /><ReconciliationPanel planId={planId} accounts={accounts.data ?? []} /><BudgetPanel planId={planId} categories={categories.data ?? []} /></main>;
+  return <main className="workspace-page">
+    <header className="page-header">
+      <div>
+        <p className="eyebrow">{selectedAccount ? "Account register" : "Plan activity"}</p>
+        <h1>{selectedAccount ? selectedAccount.name : "All activity"}</h1>
+        <p>{selectedAccount ? `${selectedAccount.account_type} · ${selectedAccount.currency_code} · recorded activity` : "Your recorded activity, transfers and reconciliation history."}</p>
+      </div>
+      <div className="entry-launcher"><button ref={trigger} type="button" className="button register-entry-button" aria-expanded={entryOpen} onClick={() => { setSaved(false); setEntryOpen(true); }}>+ Add transaction</button></div>
+    </header>
+    <LedgerNavigation />
+      {saved && !entryOpen && <p role="status" className="completion-note">Transaction added. Balances and budget have been refreshed.</p>}
+    <TransactionPanel key={planId} onSaved={() => setSaved(true)} entryOpen={entryOpen} closeEntry={closeEntry} planId={planId} accounts={accounts.data ?? []} categories={categories.data ?? []} />
+    <TransferPanel planId={planId} accounts={accounts.data ?? []} />
+    <ReconciliationPanel planId={planId} accounts={accounts.data ?? []} />
+    <TaxonomyPanel planId={planId} />
+  </main>;
 }
 
 export function AppRoutes() {
   return (
-    <Routes>
-      <Route path="/plans" element={<PlanScreen />} />
-      <Route path="/plans/:planId/accounts" element={<AccountsScreen />} />
-      <Route path="/plans/:planId/ledger" element={<LedgerScreen />} />
-      <Route path="*" element={<Navigate to="/plans" replace />} />
-    </Routes>
+    <>
+      <header className="brand-bar">
+        <Link to="/plans" className="brand-link" aria-label="Numa home">numa<span aria-hidden="true">.</span></Link>
+        <span className="brand-caption">Personal finance</span>
+      </header>
+      <Routes>
+        <Route path="/plans" element={<PlanScreen />} />
+        <Route path="/plans/:planId" element={<WorkspaceLayout />}>
+          <Route index element={<Navigate to="budget" replace />} />
+          <Route path="accounts" element={<AccountsScreen />} />
+          <Route path="budget" element={<BudgetScreen />} />
+          <Route path="ledger" element={<LedgerScreen />} />
+          <Route path="gmail" element={<GmailScreen />} />
+        </Route>
+        <Route path="*" element={<Navigate to="/plans" replace />} />
+      </Routes>
+    </>
   );
 }
 

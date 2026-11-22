@@ -12,7 +12,7 @@ from app.settings import Settings
 
 
 INITIAL_REVISION = "001_foundation"
-EXPECTED_REVISION = "006_reconciliation"
+EXPECTED_REVISION = "010_ynab_budget"
 
 
 class Base(DeclarativeBase):
